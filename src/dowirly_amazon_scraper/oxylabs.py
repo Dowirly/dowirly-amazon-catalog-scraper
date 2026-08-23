@@ -31,9 +31,15 @@ class OxylabsJobMissing(OxylabsError):
 
 
 class OxylabsRateLimitError(OxylabsError):
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.response_body = response_body or ""
 
 
 @dataclass(slots=True)
@@ -57,13 +63,16 @@ class OxylabsClient:
                 max_connections=max(100, config.poll_concurrency + 20),
                 max_keepalive_connections=50,
             ),
-            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.5"},
+            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.6"},
         )
 
-        # This is an account-agnostic starting ceiling, not a plan mapping. If the
-        # provider returns 429 while submitting, submit_batch automatically probes
-        # downward until it finds a sustainable rate.
+        # Account-agnostic ceiling. The real sustainable rate is learned from
+        # provider responses and remembered across waves so every new 100-product
+        # wave does not start by hammering the provider at the configured ceiling.
         self.submission_window_seconds = 1.05
+        self._submit_rate_ceiling = max(1, int(config.submit_rate))
+        self._submit_rate_hint = self._submit_rate_ceiling
+
         self.poll_request_rate = max(2, int(config.submit_rate * 0.8))
         self._poll_request_interval = 1.0 / self.poll_request_rate
         self._poll_pace_lock = asyncio.Lock()
@@ -87,15 +96,20 @@ class OxylabsClient:
         *,
         on_progress: Callable[[list[dict[str, Any]]], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Submit a logical batch at the fastest rate the account currently accepts.
+        """Submit at the fastest rate the account currently accepts.
 
-        No named plan is assumed. `config.submit_rate` is only the initial/max probe
-        rate. On HTTP 429, the chunk rate is automatically reduced using a bounded
-        search. After several successful windows it probes upward again, up to the
-        configured ceiling.
+        There is no named-plan mapping. ``config.submit_rate`` is only an upper
+        probe ceiling. The client remembers the sustainable rate across waves.
 
-        `on_progress` is called after every accepted chunk with all jobs accepted so
-        far, allowing the pipeline to checkpoint provider job IDs immediately.
+        On 429 while above one job/s it uses multiplicative decrease. If the
+        provider still returns 429 at one job/s, that is not usefully solved by
+        retrying every ~1 second: it usually means a dynamic/global provider bucket
+        still needs time to drain. In that state we use exponential cooldown up to
+        60 seconds, then retry automatically. After stable successful windows the
+        client cautiously increases the rate again toward the configured ceiling.
+
+        ``on_progress`` is called after every accepted chunk with all jobs accepted
+        so far, allowing exact provider job IDs to be checkpointed immediately.
         """
         value_key: str | None = None
         for candidate in ("query", "url"):
@@ -119,11 +133,12 @@ class OxylabsClient:
         if not values:
             return []
 
-        configured_ceiling = max(1, int(self.config.submit_rate))
-        effective_rate = configured_ceiling
-        lower_bound = 1
-        upper_bound = configured_ceiling
+        effective_rate = max(
+            1,
+            min(self._submit_rate_ceiling, int(self._submit_rate_hint)),
+        )
         success_windows = 0
+        consecutive_429 = 0
 
         total = len(values)
         offset = 0
@@ -151,19 +166,42 @@ class OxylabsClient:
                     raise_on_429=True,
                 )
             except OxylabsRateLimitError as exc:
-                upper_bound = max(lower_bound, effective_rate - 1)
-                effective_rate = max(1, (lower_bound + upper_bound) // 2)
+                consecutive_429 += 1
                 success_windows = 0
-                wait = max(1.1, exc.retry_after or 0.0)
-                LOGGER.warning(
-                    "SUBMIT_RATE_ADAPT | 429 | new_rate=%s jobs/s | bounds=%s-%s | retry_in=%.2fs",
-                    effective_rate,
-                    lower_bound,
-                    upper_bound,
-                    wait,
-                )
+
+                if effective_rate > 1:
+                    old_rate = effective_rate
+                    effective_rate = max(1, effective_rate // 2)
+                    self._submit_rate_hint = effective_rate
+                    wait = max(1.1, exc.retry_after or 0.0)
+                    LOGGER.warning(
+                        "SUBMIT_RATE_ADAPT | 429 | old_rate=%s | new_rate=%s jobs/s "
+                        "| retry_in=%.2fs | body=%s",
+                        old_rate,
+                        effective_rate,
+                        wait,
+                        exc.response_body[:300],
+                    )
+                else:
+                    # At one job/s another immediate retry only keeps the dynamic
+                    # bucket saturated. Back off progressively and let it recover.
+                    if exc.retry_after is not None and exc.retry_after > 0:
+                        wait = max(2.0, exc.retry_after)
+                    else:
+                        wait = min(60.0, float(2 ** min(consecutive_429, 6)))
+                    wait += random.uniform(0.0, 0.5)
+                    self._submit_rate_hint = 1
+                    LOGGER.warning(
+                        "SUBMIT_COOLDOWN | persistent 429 at 1 job/s | streak=%s "
+                        "| retry_in=%.2fs | body=%s",
+                        consecutive_429,
+                        wait,
+                        exc.response_body[:500],
+                    )
+
                 await asyncio.sleep(wait)
                 continue
+
             except (OxylabsQuotaStop, OxylabsAuthError) as exc:
                 if all_jobs:
                     self.submission_blocked_reason = str(exc)
@@ -177,8 +215,14 @@ class OxylabsClient:
                 raise
 
             jobs = self._parse_batch_jobs(response)
+            if not jobs:
+                raise OxylabsError("Oxylabs accepted a batch request but returned no jobs")
+
             all_jobs.extend(jobs)
             offset += len(chunk)
+            consecutive_429 = 0
+            self._submit_rate_hint = effective_rate
+
             if on_progress:
                 on_progress(all_jobs)
 
@@ -190,14 +234,20 @@ class OxylabsClient:
                 effective_rate,
             )
 
-            lower_bound = max(lower_bound, effective_rate)
             success_windows += 1
-            if success_windows >= 3 and effective_rate < upper_bound:
+            if success_windows >= 3 and effective_rate < self._submit_rate_ceiling:
+                # Additive-ish recovery after stability. This is intentionally much
+                # slower than the multiplicative decrease on 429.
                 effective_rate = min(
-                    upper_bound,
-                    max(effective_rate + 1, (effective_rate + upper_bound + 1) // 2),
+                    self._submit_rate_ceiling,
+                    max(effective_rate + 1, int(effective_rate * 1.25)),
                 )
+                self._submit_rate_hint = effective_rate
                 success_windows = 0
+                LOGGER.info(
+                    "SUBMIT_RATE_PROBE | stable windows; probing %s jobs/s",
+                    effective_rate,
+                )
 
         return all_jobs
 
@@ -384,6 +434,7 @@ class OxylabsClient:
                     raise OxylabsRateLimitError(
                         f"Oxylabs API HTTP 429: {text}",
                         retry_after=retry_after_seconds,
+                        response_body=text,
                     )
 
                 delay = (
