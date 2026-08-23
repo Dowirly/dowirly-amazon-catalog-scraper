@@ -47,13 +47,25 @@ class OxylabsClient:
                 max_connections=max(100, config.poll_concurrency + 20),
                 max_keepalive_connections=50,
             ),
-            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.2"},
+            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.3"},
         )
-        # Oxylabs documents the plan limit as jobs/second. A /batch request still
-        # creates one provider job per query value, so large batches are paced in
-        # plan-sized chunks. 1.05s gives a tiny rolling-window safety margin while
-        # remaining essentially at the advertised maximum throughput.
+
+        # Oxylabs documents the plan limit as submitted jobs/second. A /batch
+        # request still creates one provider job per query value, so large batches
+        # are paced in plan-sized chunks. 1.05s gives a small rolling-window margin.
         self.submission_window_seconds = 1.05
+
+        # A large Push-Pull wave can contain ~2k jobs on Free or tens of thousands
+        # on Micro. Polling every job concurrently in bursts can trigger separate
+        # dynamic API throttles even though job submission itself was correctly
+        # paced. Keep polling/result GETs evenly spaced. This does not slow Amazon
+        # scraping at Oxylabs; it only controls how quickly we ask their API for
+        # status/results. 80% of the plan submission rate leaves headroom for stats
+        # calls, result downloads, and provider-side dynamic limits.
+        self.poll_request_rate = max(2, int(config.submit_rate * 0.8))
+        self._poll_request_interval = 1.0 / self.poll_request_rate
+        self._poll_pace_lock = asyncio.Lock()
+        self._next_poll_request_at = 0.0
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -79,8 +91,8 @@ class OxylabsClient:
         ~1 second window.
 
         Accepted job IDs are checkpointed after *every* chunk. If the VPS reboots
-        halfway through submitting a 2,000-item wave, the restarted scraper can
-        poll the already-created Oxylabs jobs instead of paying for duplicates.
+        halfway through submitting a large wave, the restarted scraper can poll the
+        already-created Oxylabs jobs instead of paying for duplicates.
         """
         value_key: str | None = None
         for candidate in ("query", "url"):
@@ -89,7 +101,6 @@ class OxylabsClient:
                 break
 
         if value_key is None:
-            # Defensive fallback for a singular payload.
             response = await self._request(
                 "POST", f"{DATA_BASE}/v1/queries/batch", json=payload
             )
@@ -151,12 +162,7 @@ class OxylabsClient:
     def _persist_partial_inflight(
         self, original_payload: dict[str, Any], new_jobs: list[dict[str, Any]]
     ) -> None:
-        """Durably journal accepted provider jobs during chunked submission.
-
-        Pipeline-level checkpointing remains authoritative. This lower-level journal
-        closes the small crash window that otherwise exists while a large batch is
-        still being rate-limited and submitted chunk by chunk.
-        """
+        """Durably journal accepted provider jobs during chunked submission."""
         source = str(original_payload.get("source") or "")
         phase = {
             "amazon_search": "search",
@@ -190,8 +196,6 @@ class OxylabsClient:
 
         inflight[phase] = {
             "signature": existing.get("signature"),
-            # Preserve the original full wave payload when a retry chunk is being
-            # submitted; otherwise use the payload passed by the pipeline.
             "payload": existing.get("payload") or original_payload,
             "jobs": merged,
             "updated_at": utc_now_iso(),
@@ -210,11 +214,16 @@ class OxylabsClient:
         total = len(jobs)
         if total == 0:
             return []
+
+        LOGGER.info(
+            "POLL_CONFIG | jobs=%s | concurrency=%s | api_get_rate=%s req/s",
+            total,
+            self.config.poll_concurrency,
+            self.poll_request_rate,
+        )
+
         tasks = [asyncio.create_task(one(job)) for job in jobs]
         results: list[JobResult] = []
-        # Large Push-Pull batches can run for minutes. Emit lightweight polling
-        # progress while they are in flight so journalctl remains useful even
-        # before normalization of the whole batch begins.
         log_every = max(1, min(50, total // 10 or 1))
         for future in asyncio.as_completed(tasks):
             result = await future
@@ -245,37 +254,54 @@ class OxylabsClient:
                 return JobResult(job_id, query, status, current, None, attempts)
             await asyncio.sleep(self.config.poll_interval_seconds)
             response = await self._request(
-                "GET", f"{DATA_BASE}/v1/queries/{job_id}"
+                "GET", f"{DATA_BASE}/v1/queries/{job_id}", paced=True
             )
             current = response.json()
 
     async def get_job_results(self, job_id: str) -> dict[str, Any]:
-        # Parsed is the default when parse=true, but making it explicit protects us
-        # if a provider default changes.
         response = await self._request(
             "GET",
             f"{DATA_BASE}/v1/queries/{job_id}/results",
             params={"type": "parsed"},
+            paced=True,
         )
         return response.json()
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _pace_poll_request(self) -> None:
+        """Evenly pace status/result GETs to avoid bursty dynamic throttling."""
+        loop = asyncio.get_running_loop()
+        async with self._poll_pace_lock:
+            now = loop.time()
+            if self._next_poll_request_at > now:
+                await asyncio.sleep(self._next_poll_request_at - now)
+                now = loop.time()
+            self._next_poll_request_at = max(now, self._next_poll_request_at) + self._poll_request_interval
+
+    async def _request(
+        self, method: str, url: str, *, paced: bool = False, **kwargs: Any
+    ) -> httpx.Response:
         """HTTP wrapper with adaptive retry/backoff.
 
-        429 responses are explicitly unbilled by Oxylabs. They can still occur when
-        another process/API client shares the account or when a dynamic/domain limit
-        is temporarily lower than the nominal plan rate, so we back off and retry
-        rather than crashing a long catalog run.
+        429 is a transient throttling condition. For durable Push-Pull polling we
+        intentionally keep retrying 429 responses instead of failing the entire
+        multi-hour batch; job IDs are already persisted and results remain available
+        for retrieval. Network/5xx failures still have a finite retry budget so
+        systemd can restart the process if the connection is genuinely unhealthy.
         """
         last_exc: Exception | None = None
-        max_attempts = 10
+        transport_attempts = 10
+        attempt = 0
 
-        for attempt in range(1, max_attempts + 1):
+        while True:
+            attempt += 1
+            if paced:
+                await self._pace_poll_request()
+
             try:
                 response = await self.http.request(method, url, **kwargs)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_exc = exc
-                if attempt == max_attempts:
+                if attempt >= transport_attempts:
                     break
                 await asyncio.sleep(min(15.0, 0.5 * (2 ** (attempt - 1))))
                 continue
@@ -283,7 +309,6 @@ class OxylabsClient:
             if response.status_code in {200, 202}:
                 return response
             if response.status_code == 204:
-                # Job is not completed yet; callers that poll metadata should retry.
                 await asyncio.sleep(self.config.poll_interval_seconds)
                 continue
 
@@ -309,21 +334,19 @@ class OxylabsClient:
                 )
 
             if response.status_code == 429:
-                if attempt == max_attempts:
-                    raise OxylabsError(
-                        f"Oxylabs API HTTP 429 after adaptive retries: {text}"
-                    )
-
                 retry_after = response.headers.get("retry-after")
                 try:
                     retry_after_seconds = float(retry_after) if retry_after else None
                 except ValueError:
                     retry_after_seconds = None
 
+                # Cap exponential growth but never give up solely because of a
+                # 429. A long Push-Pull run is safer waiting than restarting and
+                # potentially hammering the same API again.
                 delay = (
                     retry_after_seconds
                     if retry_after_seconds is not None
-                    else min(30.0, 1.1 * (2 ** (attempt - 1)))
+                    else min(30.0, 1.1 * (2 ** min(attempt - 1, 5)))
                 )
                 delay += random.uniform(0.0, 0.25)
                 rate_headers = {
@@ -333,9 +356,8 @@ class OxylabsClient:
                     or key.lower() == "retry-after"
                 }
                 LOGGER.warning(
-                    "RATE_LIMIT | HTTP 429 | attempt=%s/%s | retry_in=%.2fs | headers=%s | body=%s",
+                    "RATE_LIMIT | HTTP 429 | attempt=%s | retry_in=%.2fs | headers=%s | body=%s",
                     attempt,
-                    max_attempts,
                     delay,
                     rate_headers,
                     text[:500],
@@ -344,7 +366,7 @@ class OxylabsClient:
                 continue
 
             if response.status_code >= 500:
-                if attempt == max_attempts:
+                if attempt >= transport_attempts:
                     raise OxylabsError(
                         f"Oxylabs API HTTP {response.status_code} after retries: {text}"
                     )
