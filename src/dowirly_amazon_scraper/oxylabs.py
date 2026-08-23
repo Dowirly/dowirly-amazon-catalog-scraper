@@ -22,6 +22,14 @@ class OxylabsError(RuntimeError):
     pass
 
 
+class OxylabsAuthError(OxylabsError):
+    """Permanent authentication failure (HTTP 401).
+
+    Retrying the service cannot fix invalid/revoked API credentials, so the CLI
+    maps this to a dedicated exit code that systemd is configured not to restart.
+    """
+
+
 class OxylabsQuotaStop(OxylabsError):
     """Raised for responses that look like an account/quota exhaustion condition."""
 
@@ -47,7 +55,7 @@ class OxylabsClient:
                 max_connections=max(100, config.poll_concurrency + 20),
                 max_keepalive_connections=50,
             ),
-            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.3"},
+            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.4"},
         )
 
         # Oxylabs documents the plan limit as submitted jobs/second. A /batch
@@ -280,14 +288,7 @@ class OxylabsClient:
     async def _request(
         self, method: str, url: str, *, paced: bool = False, **kwargs: Any
     ) -> httpx.Response:
-        """HTTP wrapper with adaptive retry/backoff.
-
-        429 is a transient throttling condition. For durable Push-Pull polling we
-        intentionally keep retrying 429 responses instead of failing the entire
-        multi-hour batch; job IDs are already persisted and results remain available
-        for retrieval. Network/5xx failures still have a finite retry budget so
-        systemd can restart the process if the connection is genuinely unhealthy.
-        """
+        """HTTP wrapper with adaptive retry/backoff."""
         last_exc: Exception | None = None
         transport_attempts = 10
         attempt = 0
@@ -314,6 +315,13 @@ class OxylabsClient:
 
             text = response.text[:2000]
             lower = text.lower()
+
+            if response.status_code == 401:
+                raise OxylabsAuthError(
+                    "Oxylabs API HTTP 401: API credentials are missing, invalid, expired, or revoked. "
+                    "Update OXYLABS_USERNAME/OXYLABS_PASSWORD in .env with the Web Scraper API user credentials."
+                )
+
             if response.status_code == 403 and any(
                 key in lower
                 for key in (
@@ -328,7 +336,7 @@ class OxylabsClient:
                 raise OxylabsQuotaStop(
                     f"Oxylabs stopped accepting jobs: HTTP 403 {text}"
                 )
-            if response.status_code in {401, 403, 400, 422}:
+            if response.status_code in {403, 400, 422}:
                 raise OxylabsError(
                     f"Oxylabs API HTTP {response.status_code}: {text}"
                 )
@@ -340,9 +348,6 @@ class OxylabsClient:
                 except ValueError:
                     retry_after_seconds = None
 
-                # Cap exponential growth but never give up solely because of a
-                # 429. A long Push-Pull run is safer waiting than restarting and
-                # potentially hammering the same API again.
                 delay = (
                     retry_after_seconds
                     if retry_after_seconds is not None
