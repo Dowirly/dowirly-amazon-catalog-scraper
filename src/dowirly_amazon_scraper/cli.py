@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import IO
 
 from .config import build_config, load_search_plan
+from .oxylabs import OxylabsAuthError
 from .pipeline import Pipeline
 
 
@@ -84,11 +85,7 @@ def setup_logging(verbose: bool) -> None:
 
 
 def acquire_instance_lock(data_dir: Path) -> IO[str]:
-    """Prevent a systemd run and a manual run from consuming the same quota.
-
-    The advisory lock is owned by the running process and is automatically released
-    by the kernel if the process crashes or the VPS reboots.
-    """
+    """Prevent a systemd run and a manual run from consuming the same quota."""
     data_dir.mkdir(parents=True, exist_ok=True)
     lock_path = data_dir / ".scraper.lock"
     handle = lock_path.open("a+", encoding="utf-8")
@@ -153,6 +150,11 @@ def main() -> None:
     except AlreadyRunningError as exc:
         logging.getLogger(__name__).error("%s", exc)
         code = 2
+    except OxylabsAuthError as exc:
+        # Dedicated permanent-failure code. systemd uses RestartPreventExitStatus=3
+        # so invalid/revoked credentials do not create an endless restart loop.
+        logging.getLogger(__name__).error("AUTH_FAILURE | %s", exc)
+        code = 3
     except Exception as exc:
         logging.getLogger(__name__).exception(
             "Fatal configuration/runtime error: %s", exc
