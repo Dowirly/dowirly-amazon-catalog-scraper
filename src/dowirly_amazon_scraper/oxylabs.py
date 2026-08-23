@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 from dataclasses import dataclass
-from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from .config import AppConfig
-from .utils import atomic_write_json, utc_now_iso
 
 LOGGER = logging.getLogger(__name__)
-
 DATA_BASE = "https://data.oxylabs.io"
 
 
@@ -23,15 +19,17 @@ class OxylabsError(RuntimeError):
 
 
 class OxylabsAuthError(OxylabsError):
-    """Permanent authentication failure (HTTP 401).
-
-    Retrying the service cannot fix invalid/revoked API credentials, so the CLI
-    maps this to a dedicated exit code that systemd is configured not to restart.
-    """
+    """Authentication/subscription access failure (HTTP 401)."""
 
 
 class OxylabsQuotaStop(OxylabsError):
-    """Raised for responses that look like an account/quota exhaustion condition."""
+    """Provider refused more work because of quota/balance/subscription limits."""
+
+
+class OxylabsRateLimitError(OxylabsError):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 @dataclass(slots=True)
@@ -55,52 +53,45 @@ class OxylabsClient:
                 max_connections=max(100, config.poll_concurrency + 20),
                 max_keepalive_connections=50,
             ),
-            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.4"},
+            headers={"User-Agent": "dowirly-amazon-catalog-scraper/0.5"},
         )
 
-        # Oxylabs documents the plan limit as submitted jobs/second. A /batch
-        # request still creates one provider job per query value, so large batches
-        # are paced in plan-sized chunks. 1.05s gives a small rolling-window margin.
+        # This is an account-agnostic starting ceiling, not a plan mapping. If the
+        # provider returns 429 while submitting, submit_batch automatically probes
+        # downward until it finds a sustainable rate.
         self.submission_window_seconds = 1.05
-
-        # A large Push-Pull wave can contain ~2k jobs on Free or tens of thousands
-        # on Micro. Polling every job concurrently in bursts can trigger separate
-        # dynamic API throttles even though job submission itself was correctly
-        # paced. Keep polling/result GETs evenly spaced. This does not slow Amazon
-        # scraping at Oxylabs; it only controls how quickly we ask their API for
-        # status/results. 80% of the plan submission rate leaves headroom for stats
-        # calls, result downloads, and provider-side dynamic limits.
         self.poll_request_rate = max(2, int(config.submit_rate * 0.8))
         self._poll_request_interval = 1.0 / self.poll_request_rate
         self._poll_pace_lock = asyncio.Lock()
         self._next_poll_request_at = 0.0
 
+        # Set when a multi-chunk submission is partially accepted and then the
+        # provider refuses further work. The caller can still collect the already
+        # accepted jobs before stopping.
+        self.submission_blocked_reason: str | None = None
+
     async def close(self) -> None:
         await self.http.aclose()
 
-    async def get_usage_stats(self, plan: str) -> dict[str, Any]:
-        params: dict[str, str] = {}
-        if plan == "micro":
-            today = date.today()
-            params = {
-                "date_from": today.replace(day=1).isoformat(),
-                "date_to": today.isoformat(),
-            }
-        response = await self._request("GET", f"{DATA_BASE}/v2/stats", params=params)
+    async def get_usage_stats(self) -> dict[str, Any]:
+        response = await self._request("GET", f"{DATA_BASE}/v2/stats")
         return response.json()
 
-    async def submit_batch(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        """Submit a Push-Pull batch at the fastest safe plan rate.
+    async def submit_batch(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_progress: Callable[[list[dict[str, Any]]], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Submit a logical batch at the fastest rate the account currently accepts.
 
-        Oxylabs accepts up to 5,000 values in a batch payload, but the account also
-        has a jobs/second rate limit. Every query inside the batch is a separate
-        provider job, so we split a large payload into chunks no larger than the
-        configured plan rate (10/s on Free, 50/s on Micro) and submit one chunk per
-        ~1 second window.
+        No named plan is assumed. `config.submit_rate` is only the initial/max probe
+        rate. On HTTP 429, the chunk rate is automatically reduced using a bounded
+        search. After several successful windows it probes upward again, up to the
+        configured ceiling.
 
-        Accepted job IDs are checkpointed after *every* chunk. If the VPS reboots
-        halfway through submitting a large wave, the restarted scraper can poll the
-        already-created Oxylabs jobs instead of paying for duplicates.
+        `on_progress` is called after every accepted chunk with all jobs accepted so
+        far, allowing the pipeline to checkpoint provider job IDs immediately.
         """
         value_key: str | None = None
         for candidate in ("query", "url"):
@@ -110,50 +101,99 @@ class OxylabsClient:
 
         if value_key is None:
             response = await self._request(
-                "POST", f"{DATA_BASE}/v1/queries/batch", json=payload
+                "POST",
+                f"{DATA_BASE}/v1/queries/batch",
+                json=payload,
+                raise_on_429=True,
             )
             jobs = self._parse_batch_jobs(response)
-            self._persist_partial_inflight(payload, jobs)
+            if on_progress:
+                on_progress(jobs)
             return jobs
 
         values = list(payload.get(value_key) or [])
         if not values:
             return []
 
-        safe_rate = max(1, int(self.config.submit_rate))
+        configured_ceiling = max(1, int(self.config.submit_rate))
+        effective_rate = configured_ceiling
+        lower_bound = 1
+        upper_bound = configured_ceiling
+        success_windows = 0
+
         total = len(values)
+        offset = 0
         all_jobs: list[dict[str, Any]] = []
         loop = asyncio.get_running_loop()
         previous_submission_started: float | None = None
 
-        for offset in range(0, total, safe_rate):
+        while offset < total:
             if previous_submission_started is not None:
                 elapsed = loop.time() - previous_submission_started
                 delay = max(0.0, self.submission_window_seconds - elapsed)
                 if delay:
                     await asyncio.sleep(delay)
 
-            chunk = values[offset : offset + safe_rate]
+            chunk = values[offset : offset + effective_rate]
             chunk_payload = dict(payload)
             chunk_payload[value_key] = chunk
             previous_submission_started = loop.time()
 
-            response = await self._request(
-                "POST", f"{DATA_BASE}/v1/queries/batch", json=chunk_payload
-            )
+            try:
+                response = await self._request(
+                    "POST",
+                    f"{DATA_BASE}/v1/queries/batch",
+                    json=chunk_payload,
+                    raise_on_429=True,
+                )
+            except OxylabsRateLimitError as exc:
+                upper_bound = max(lower_bound, effective_rate - 1)
+                effective_rate = max(1, (lower_bound + upper_bound) // 2)
+                success_windows = 0
+                wait = max(1.1, exc.retry_after or 0.0)
+                LOGGER.warning(
+                    "SUBMIT_RATE_ADAPT | 429 | new_rate=%s jobs/s | bounds=%s-%s | retry_in=%.2fs",
+                    effective_rate,
+                    lower_bound,
+                    upper_bound,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            except (OxylabsQuotaStop, OxylabsAuthError) as exc:
+                if all_jobs:
+                    self.submission_blocked_reason = str(exc)
+                    LOGGER.warning(
+                        "SUBMIT_STOP | accepted_jobs=%s/%s | reason=%s | collecting accepted jobs before exit",
+                        len(all_jobs),
+                        total,
+                        exc,
+                    )
+                    return all_jobs
+                raise
+
             jobs = self._parse_batch_jobs(response)
             all_jobs.extend(jobs)
-
-            # Persist immediately, not after all chunks have been submitted.
-            self._persist_partial_inflight(payload, all_jobs)
+            offset += len(chunk)
+            if on_progress:
+                on_progress(all_jobs)
 
             LOGGER.info(
-                "SUBMIT | accepted_jobs=%s/%s | last_chunk=%s | safe_plan_rate=%s jobs/s",
+                "SUBMIT | accepted_jobs=%s/%s | last_chunk=%s | effective_rate=%s jobs/s",
                 len(all_jobs),
                 total,
                 len(jobs),
-                safe_rate,
+                effective_rate,
             )
+
+            lower_bound = max(lower_bound, effective_rate)
+            success_windows += 1
+            if success_windows >= 3 and effective_rate < upper_bound:
+                effective_rate = min(
+                    upper_bound,
+                    max(effective_rate + 1, (effective_rate + upper_bound + 1) // 2),
+                )
+                success_windows = 0
 
         return all_jobs
 
@@ -166,49 +206,6 @@ class OxylabsClient:
                 f"Unexpected batch response shape: {str(body)[:1000]}"
             )
         return queries
-
-    def _persist_partial_inflight(
-        self, original_payload: dict[str, Any], new_jobs: list[dict[str, Any]]
-    ) -> None:
-        """Durably journal accepted provider jobs during chunked submission."""
-        source = str(original_payload.get("source") or "")
-        phase = {
-            "amazon_search": "search",
-            "amazon_product": "product",
-        }.get(source)
-        if phase is None:
-            return
-
-        checkpoint_path = self.config.data_dir / "intermediate" / "checkpoint.json"
-        checkpoint: dict[str, Any] = {}
-        if checkpoint_path.exists():
-            try:
-                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                checkpoint = {}
-
-        checkpoint.setdefault("version", 2)
-        checkpoint.setdefault("completed_search_keys", [])
-        checkpoint.setdefault("completed_product_asins", [])
-        inflight = checkpoint.setdefault("inflight_jobs", {})
-        existing = inflight.get(phase) or {}
-
-        merged: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for job in list(existing.get("jobs") or []) + list(new_jobs):
-            job_id = str(job.get("id") or "")
-            if not job_id or job_id in seen_ids:
-                continue
-            seen_ids.add(job_id)
-            merged.append(job)
-
-        inflight[phase] = {
-            "signature": existing.get("signature"),
-            "payload": existing.get("payload") or original_payload,
-            "jobs": merged,
-            "updated_at": utc_now_iso(),
-        }
-        atomic_write_json(checkpoint_path, checkpoint)
 
     async def poll_jobs(
         self, jobs: list[dict[str, Any]], *, max_retries: int
@@ -248,6 +245,7 @@ class OxylabsClient:
         job_id = str(job.get("id"))
         query = str(job.get("query") or job.get("url") or "")
         attempts = 1
+
         while True:
             status = str(current.get("status") or "pending")
             if status == "done":
@@ -256,13 +254,16 @@ class OxylabsClient:
             if status == "faulted":
                 if attempts <= max_retries:
                     LOGGER.warning(
-                        "Job %s faulted; re-submission is deferred to the pipeline retry pass.",
+                        "Job %s faulted; retry is handled by the pipeline after collection.",
                         job_id,
                     )
                 return JobResult(job_id, query, status, current, None, attempts)
+
             await asyncio.sleep(self.config.poll_interval_seconds)
             response = await self._request(
-                "GET", f"{DATA_BASE}/v1/queries/{job_id}", paced=True
+                "GET",
+                f"{DATA_BASE}/v1/queries/{job_id}",
+                paced=True,
             )
             current = response.json()
 
@@ -276,19 +277,25 @@ class OxylabsClient:
         return response.json()
 
     async def _pace_poll_request(self) -> None:
-        """Evenly pace status/result GETs to avoid bursty dynamic throttling."""
         loop = asyncio.get_running_loop()
         async with self._poll_pace_lock:
             now = loop.time()
             if self._next_poll_request_at > now:
                 await asyncio.sleep(self._next_poll_request_at - now)
                 now = loop.time()
-            self._next_poll_request_at = max(now, self._next_poll_request_at) + self._poll_request_interval
+            self._next_poll_request_at = (
+                max(now, self._next_poll_request_at) + self._poll_request_interval
+            )
 
     async def _request(
-        self, method: str, url: str, *, paced: bool = False, **kwargs: Any
+        self,
+        method: str,
+        url: str,
+        *,
+        paced: bool = False,
+        raise_on_429: bool = False,
+        **kwargs: Any,
     ) -> httpx.Response:
-        """HTTP wrapper with adaptive retry/backoff."""
         last_exc: Exception | None = None
         transport_attempts = 10
         attempt = 0
@@ -318,8 +325,7 @@ class OxylabsClient:
 
             if response.status_code == 401:
                 raise OxylabsAuthError(
-                    "Oxylabs API HTTP 401: API credentials are missing, invalid, expired, or revoked. "
-                    "Update OXYLABS_USERNAME/OXYLABS_PASSWORD in .env with the Web Scraper API user credentials."
+                    "Oxylabs API HTTP 401: authentication or subscription access is inactive."
                 )
 
             if response.status_code == 403 and any(
@@ -336,6 +342,7 @@ class OxylabsClient:
                 raise OxylabsQuotaStop(
                     f"Oxylabs stopped accepting jobs: HTTP 403 {text}"
                 )
+
             if response.status_code in {403, 400, 422}:
                 raise OxylabsError(
                     f"Oxylabs API HTTP {response.status_code}: {text}"
@@ -348,23 +355,22 @@ class OxylabsClient:
                 except ValueError:
                     retry_after_seconds = None
 
+                if raise_on_429:
+                    raise OxylabsRateLimitError(
+                        f"Oxylabs API HTTP 429: {text}",
+                        retry_after=retry_after_seconds,
+                    )
+
                 delay = (
                     retry_after_seconds
                     if retry_after_seconds is not None
                     else min(30.0, 1.1 * (2 ** min(attempt - 1, 5)))
                 )
                 delay += random.uniform(0.0, 0.25)
-                rate_headers = {
-                    key: value
-                    for key, value in response.headers.items()
-                    if key.lower().startswith("x-ratelimit")
-                    or key.lower() == "retry-after"
-                }
                 LOGGER.warning(
-                    "RATE_LIMIT | HTTP 429 | attempt=%s | retry_in=%.2fs | headers=%s | body=%s",
+                    "RATE_LIMIT | HTTP 429 | attempt=%s | retry_in=%.2fs | body=%s",
                     attempt,
                     delay,
-                    rate_headers,
                     text[:500],
                 )
                 await asyncio.sleep(delay)
