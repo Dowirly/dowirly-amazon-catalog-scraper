@@ -47,7 +47,7 @@ p=Path(sys.argv[1])
 try:
     data=json.loads(p.read_text(encoding='utf-8'))
 except Exception as exc:
-    print(f"Checkpoint            : unreadable ({exc})")
+    print(f"Checkpoint             : unreadable ({exc})")
 else:
     inflight=data.get('inflight_jobs') or {}
     jobs=sum(len((v or {}).get('jobs') or []) for v in inflight.values())
@@ -66,11 +66,19 @@ PY
 
   if command -v journalctl >/dev/null 2>&1; then
     local latest
-    latest="$(journalctl -u "$SERVICE" -n 300 --no-pager -o cat 2>/dev/null | grep 'PROGRESS |' | tail -n 1 || true)"
+    latest="$(journalctl -u "$SERVICE" -n 400 --no-pager -o cat 2>/dev/null | grep -E 'WAVE \||RESUME \||SUBMIT \||SUBMIT_RATE_ADAPT \||POLL \||PROGRESS \||PROVIDER_STOP' | tail -n 1 || true)"
     if [[ -n "$latest" ]]; then
       echo
-      echo "Latest progress log:"
+      echo "Latest scraper activity:"
       echo "$latest"
+    fi
+
+    local stop_line
+    stop_line="$(journalctl -u "$SERVICE" -n 400 --no-pager -o cat 2>/dev/null | grep -E 'PROVIDER_STOP|Graceful provider stop|AUTH_FAILURE|SUBMIT_STOP' | tail -n 1 || true)"
+    if [[ -n "$stop_line" ]]; then
+      echo
+      echo "Latest provider stop/boundary:"
+      echo "$stop_line"
     fi
 
     if [[ "$service_state" == "failed" ]]; then
