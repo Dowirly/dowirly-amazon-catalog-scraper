@@ -1,131 +1,126 @@
-# Output, Timing, Pricing, and Error Report
+# Output, Recovery, and Error Report
 
-## Output files
+## Runtime outputs
 
-All runtime data lives under `data/` and is intentionally ignored by Git because it can become very large and contains marketplace-derived content.
+All runtime data lives under `data/` and is ignored by Git.
 
-### `data/raw/search_results.jsonl`
-One line per completed Amazon search job. It stores the entire parsed Oxylabs result wrapper before any filtering.
+- `data/raw/search_results.jsonl` — full retrieved Amazon search responses.
+- `data/intermediate/discovered_products.jsonl` — every ASIN occurrence from search.
+- `data/intermediate/unique_candidates.jsonl` — deduplicated partial products discovered from search.
+- `data/raw/product_results.jsonl` — full retrieved Amazon product responses, written before normalization.
+- `data/intermediate/rejected_products.jsonl` — rejected full-product results and reasons.
+- `data/intermediate/checkpoint.json` — completed work plus exact in-flight provider job IDs.
+- `data/final/products.jsonl` — normalized full products for the database.
+- `data/final/embedding_input.jsonl` — embedding-ready semantic text and metadata.
+- `data/reports/run-<UTC>.md` — measured run summary.
 
-### `data/intermediate/discovered_products.jsonl`
-One line for every ASIN occurrence discovered from Amazon search output. Duplicates are expected here; this is an audit trail.
+## Durable product waves
 
-### `data/intermediate/unique_candidates.jsonl`
-Deduplicated ASINs with all queries/categories/buckets that discovered them.
+The scraper no longer submits all remaining product work and waits for one giant batch. Production defaults to 100 full products per durable wave:
 
-### `data/raw/product_results.jsonl`
-One line per retrieved full Amazon product result. This is written **before** validation/normalization so no fetched data is lost.
-
-### `data/intermediate/rejected_products.jsonl`
-Rejected ASIN + reason(s), such as:
-
-```json
-{"asin":"B0EXAMPLE1","reasons":["missing_images","missing_category"],"job_id":"..."}
+```text
+submit wave
+→ poll/download wave
+→ save raw product responses
+→ validate/normalize
+→ save final product + embedding input
+→ checkpoint completion
+→ submit next wave
 ```
 
-### `data/final/products.jsonl`
-One normalized full product per line. Representative shape:
+This means accepted product counts increase continuously during a long run. If the VPS, network, or provider access fails later, earlier completed waves are already local and usable.
+
+An old checkpoint containing a large in-flight product batch is migrated naturally: the saved provider job IDs are polled and processed only `wave_size` at a time without duplicate submission.
+
+## No named-plan coupling
+
+The scraper contains no `free`, `micro`, or other subscription-plan mapping.
+
+Without `--max-results`, it does not guess an account quota. It keeps working until provider enforcement stops new/API work, `--max-products` is reached, or the configured search space is exhausted.
+
+If an explicit result ceiling is desired, it can be set independently:
+
+```bash
+dowirly-scrape --mode production --max-results 50000
+```
+
+## Throughput
+
+`--submit-rate` is a configurable probe ceiling, not a plan selection. The default is 50 jobs/s. HTTP 429 during submission causes the scraper to lower the active rate automatically. After stable windows it cautiously probes upward again.
+
+Product wave size and submission rate are separate concepts: a 100-product wave can still be submitted rapidly and processed concurrently, but the next wave is not submitted until the current one is downloaded and saved.
+
+## Final product model
+
+`data/final/products.jsonl` contains one normalized product per line, including fields such as:
 
 ```json
 {
-  "schema_version": "1.0",
-  "id": "amazon-sa:B0CHXS73N7",
+  "id": "amazon-sa:B0...",
   "source": "amazon",
   "marketplace": "amazon.sa",
-  "external_id": "B0CHXS73N7",
-  "parent_external_id": null,
-  "url": "https://www.amazon.sa/dp/B0CHXS73N7",
-  "title": "Apple iPhone 15 (128 GB) - Blue",
-  "brand": "Apple",
-  "manufacturer": "Apple",
+  "external_id": "B0...",
+  "url": "https://www.amazon.sa/dp/B0...",
+  "title": "...",
+  "brand": "...",
+  "manufacturer": "...",
   "description": "...",
-  "bullet_points": ["..."],
+  "bullet_points": [],
   "category": {
-    "primary": "Electronics",
-    "leaf": "Mobile Phones",
-    "path": ["Electronics", "Mobiles & Accessories", "Mobile Phones"],
-    "breadcrumbs": [{"name":"Electronics","url":"..."}],
-    "discovery_labels": ["Mobile Phones & Accessories"]
+    "primary": "...",
+    "leaf": "...",
+    "path": [],
+    "breadcrumbs": [],
+    "discovery_labels": []
   },
-  "images": ["https://..."],
-  "pricing": {"currency":"SAR","current":2299.0,"initial":2459.0},
-  "availability": {"stock":"In stock","prime_eligible":true},
-  "rating": {"value":4.5,"reviews_count":1121,"distribution":[]},
-  "seller": {"name":"...","seller_id":"...","is_amazon_fulfilled":true},
+  "images": [],
+  "pricing": {},
+  "availability": {},
+  "rating": {},
+  "seller": {},
   "sales_rank": [],
   "variations": [],
-  "delivery": [],
-  "badges": {"amazon_choice":true,"has_videos":false},
-  "attributes": {
-    "product_overview": [{"title":"Brand","description":"Apple"}],
-    "product_details": {},
-    "developer_info": {},
-    "product_dimensions": null,
-    "item_form": null,
-    "warranty_and_support": null
-  },
-  "embedding_text": "Title: ...\n\nBrand: ...\n\nCategory: ..."
+  "attributes": {},
+  "embedding_text": "..."
 }
 ```
 
-### `data/final/embedding_input.jsonl`
-Directly usable as the input layer for an embeddings worker:
+## Embedding input
+
+`data/final/embedding_input.jsonl` is keyed to the same product ID:
 
 ```json
-{"id":"amazon-sa:B0CHXS73N7","external_id":"B0CHXS73N7","text":"Title: ...","metadata":{"source":"amazon","marketplace":"amazon.sa","category":{},"brand":"Apple"}}
+{
+  "id": "amazon-sa:B0...",
+  "external_id": "B0...",
+  "text": "Title: ...\nBrand: ...\nCategory: ...",
+  "metadata": {
+    "source": "amazon",
+    "marketplace": "amazon.sa",
+    "category": {},
+    "brand": "..."
+  }
+}
 ```
 
-`embedding_text` deliberately excludes price, stock, and review counts because those values change frequently and work better as database filters/ranking signals.
+Dynamic price/stock/review counts are intentionally excluded from embedding text and should remain structured DB/ranking fields.
 
-## Runtime report
+## Partial product export
 
-Every run generates `data/reports/run-<UTC timestamp>.md` containing measured wall-clock duration, guarded Oxylabs usage before/after, search/product jobs, faulted jobs, accepted/rejected counts, and the graceful-stop reason. The guarded usage is the maximum of provider-reported usage and the scraper's locally observed completed-job floor, because usage statistics can lag on fresh/free accounts.
+Even before full-product enrichment, `data/intermediate/unique_candidates.jsonl` is useful as a partial/staging catalog. It can contain ASIN, title, URL, image, price, currency, rating, review count, manufacturer, and discovery evidence when those values were present in Amazon search results.
 
-There is no honest fixed time estimate before running because Oxylabs/Amazon latency varies. Push-Pull batch jobs run asynchronously at Oxylabs; the VPS is not scraping product pages sequentially. The measured run report is authoritative for the actual run.
+## Error and recovery behavior
 
-## Pricing / quota facts used by the script
+- VPS reboot/process crash: exact current-wave job IDs remain in the checkpoint and are resumed.
+- SSH disconnect: systemd run is unaffected.
+- HTTP 429 during submit: adaptive rate reduction; no plan-specific rate assumption.
+- HTTP 429 during polling/results: paced retry/backoff.
+- HTTP 5xx/network failure: retry/backoff; systemd can restart if the process eventually exits.
+- HTTP 401: authentication/subscription access stop. Already-local waves remain valid; any current in-flight provider IDs remain checkpointed.
+- Quota-like HTTP 403: graceful provider stop with checkpoint preserved.
+- Provider-faulted jobs: optionally retried, then rejected if still faulted.
+- Final product and embedding files are append-only/fsynced and deduplicated by ASIN on resume.
 
-Current official Oxylabs Web Scraper API pricing used for guardrails:
+## Important boundary behavior
 
-| Plan | Max results | Job submission rate | Base price |
-|---|---:|---:|---:|
-| Free Trial | 2,000 | 10 jobs/s | $0 |
-| Micro | 98,000 Amazon no-JS results | 50 jobs/s | $49/month before VAT |
-
-Oxylabs defines a result as a distinct retrieved content entity/page. Target-site `2xx` and `4xx` results are billable; provider/system `5xx`/`6xx` failures are not. `429` rate-limit results are not billed. The usage-statistics endpoint itself is free.
-
-The script uses `parse=true` without JS rendering for the Amazon dedicated parsers. It does not enable image/media download billing.
-
-## Why Free Trial cannot produce 2,000 full products
-
-A search page used to discover ASINs is itself a result. A full `amazon_product` page is another result. Therefore a 2,000-result trial must be split between discovery and enrichment. The pipeline uses discovery incrementally and stops as soon as it has enough unique candidates, maximizing the remaining result slots for full product pages.
-
-## Why 90,000 clean products are tight on Micro
-
-90,000 product pages consume about 90,000 of the 98,000-result maximum if each page is billable. Discovery pages and billable invalid `4xx` product pages also consume results. The program will safely maximize accepted products, but it will not exceed the 98,000 guard to chase a target.
-
-## Error behavior
-
-- `SIGINT` / `SIGTERM`: graceful stop; in-flight wave finishes where possible; files/checkpoint remain valid.
-- VPS/process reboot during a submitted batch: exact in-flight Oxylabs job IDs are persisted before polling and are polled again after restart rather than submitted again.
-- HTTP `429`: exponential retry; documented as unbilled.
-- HTTP `5xx` / network timeout: retry with backoff.
-- HTTP `401`: stop because credentials are invalid.
-- HTTP `400` / `422`: stop because request shape is invalid.
-- Quota-like HTTP `403`: graceful quota stop.
-- Oxylabs job `faulted`: recorded; not treated as a product; official stats are refreshed so unbilled capacity can be reused.
-- Amazon/target `4xx`: raw response is stored and the product is rejected; the request may still be billable according to Oxylabs.
-- Parser `12000`: full success.
-- Parser `12004` / `12005`: accepted only if required product fields are actually present.
-- Other parser failure codes: rejected.
-
-## Official docs
-
-- https://oxylabs.io/products/scraper-api/web/pricings
-- https://developers.oxylabs.io/scraping-solutions/web-scraper-api/targets/amazon/search
-- https://developers.oxylabs.io/scraping-solutions/web-scraper-api/targets/amazon/product
-- https://developers.oxylabs.io/scraping-solutions/web-scraper-api/integration-methods/push-pull
-- https://developers.oxylabs.io/scraping-solutions/web-scraper-api/usage-and-billing/usage-statistics
-- https://developers.oxylabs.io/scraping-solutions/web-scraper-api/usage-and-billing/billing-information
-- https://developers.oxylabs.io/scraping-solutions/web-scraper-api/usage-and-billing/rate-limits
-- https://developers.oxylabs.io/scraper-apis/web-scraper-api/response-codes
+No client can guarantee that a provider will still allow result downloads after it hard-disables API access at an unknown quota/subscription boundary. The wave design minimizes this exposure: at most the current small wave remains provider-side, instead of thousands of products. If the provider allows the current wave to be downloaded, it is saved before any new wave is submitted.
