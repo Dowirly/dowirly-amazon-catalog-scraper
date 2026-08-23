@@ -26,6 +26,10 @@ class OxylabsQuotaStop(OxylabsError):
     """Provider refused more work because of quota/balance/subscription limits."""
 
 
+class OxylabsJobMissing(OxylabsError):
+    """A previously saved provider job/result is no longer available (HTTP 404)."""
+
+
 class OxylabsRateLimitError(OxylabsError):
     def __init__(self, message: str, retry_after: float | None = None) -> None:
         super().__init__(message)
@@ -249,7 +253,15 @@ class OxylabsClient:
         while True:
             status = str(current.get("status") or "pending")
             if status == "done":
-                result = await self.get_job_results(job_id)
+                try:
+                    result = await self.get_job_results(job_id)
+                except OxylabsJobMissing:
+                    LOGGER.warning(
+                        "JOB_MISSING | job_id=%s | query=%s | result is no longer available",
+                        job_id,
+                        query,
+                    )
+                    return JobResult(job_id, query, "faulted", current, None, attempts)
                 return JobResult(job_id, query, status, current, result, attempts)
             if status == "faulted":
                 if attempts <= max_retries:
@@ -260,11 +272,19 @@ class OxylabsClient:
                 return JobResult(job_id, query, status, current, None, attempts)
 
             await asyncio.sleep(self.config.poll_interval_seconds)
-            response = await self._request(
-                "GET",
-                f"{DATA_BASE}/v1/queries/{job_id}",
-                paced=True,
-            )
+            try:
+                response = await self._request(
+                    "GET",
+                    f"{DATA_BASE}/v1/queries/{job_id}",
+                    paced=True,
+                )
+            except OxylabsJobMissing:
+                LOGGER.warning(
+                    "JOB_MISSING | job_id=%s | query=%s | status is no longer available",
+                    job_id,
+                    query,
+                )
+                return JobResult(job_id, query, "faulted", current, None, attempts)
             current = response.json()
 
     async def get_job_results(self, job_id: str) -> dict[str, Any]:
@@ -322,6 +342,11 @@ class OxylabsClient:
 
             text = response.text[:2000]
             lower = text.lower()
+
+            if response.status_code == 404:
+                raise OxylabsJobMissing(
+                    f"Oxylabs job/result is no longer available: {url}"
+                )
 
             if response.status_code == 401:
                 raise OxylabsAuthError(
