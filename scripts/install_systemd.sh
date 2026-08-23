@@ -28,8 +28,9 @@ cat > "$TMP" <<EOF
 Description=Dowirly Amazon.sa catalog scraper
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Do not permanently enter start-limit-failed after several transient API/network
+# failures. Restart=on-failure below still avoids restarting a normal completed run.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -38,7 +39,7 @@ WorkingDirectory=$ROOT
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_BIN --mode production --plan $PLAN
 Restart=on-failure
-RestartSec=15
+RestartSec=20
 KillSignal=SIGTERM
 TimeoutStopSec=300
 
@@ -48,6 +49,8 @@ EOF
 
 sudo install -m 0644 "$TMP" "/etc/systemd/system/$SERVICE_NAME"
 sudo systemctl daemon-reload
+# Clear a previous start-limit/failed state before enabling the repaired service.
+sudo systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
 sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl restart "$SERVICE_NAME"
 
