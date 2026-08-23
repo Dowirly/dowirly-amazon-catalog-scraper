@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dowirly-amazon-catalog-scraper"
+version = "0.1.0"
+description = "Budget-aware Amazon.sa catalog collector using Oxylabs Web Scraper API."
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27,<1",
+  "PyYAML>=6.0,<7",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+dowirly-scrape = "dowirly_amazon_scraper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
