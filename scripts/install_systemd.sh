@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLAN="${1:-free}"
-if [[ "$PLAN" != "free" && "$PLAN" != "micro" ]]; then
-  echo "Usage: $0 [free|micro]" >&2
+if [[ $# -gt 0 ]]; then
+  echo "Usage: $0" >&2
+  echo "Named plans are no longer configured by the scraper. Use .env/CLI limits only if you want explicit caps." >&2
   exit 2
 fi
 
@@ -28,7 +28,6 @@ cat > "$TMP" <<EOF
 Description=Dowirly Amazon.sa catalog scraper
 Wants=network-online.target
 After=network-online.target
-# Do not permanently enter start-limit-failed after transient API/network issues.
 StartLimitIntervalSec=0
 
 [Service]
@@ -36,11 +35,8 @@ Type=simple
 User=$USER_NAME
 WorkingDirectory=$ROOT
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$VENV_BIN --mode production --plan $PLAN
+ExecStart=$VENV_BIN --mode production
 Restart=on-failure
-# CLI exit code 3 means permanent Oxylabs authentication failure. Repeated restarts
-# cannot repair credentials and only spam the provider/logs, so leave the service
-# stopped until .env/API credentials are corrected and it is started manually.
 RestartPreventExitStatus=3
 RestartSec=20
 KillSignal=SIGTERM
@@ -57,6 +53,7 @@ sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl restart "$SERVICE_NAME"
 
 echo "Installed and started $SERVICE_NAME"
+echo "The service has no named plan configuration; provider/account limits are authoritative unless you set SCRAPER_MAX_RESULTS."
 echo "Monitor:  sudo journalctl -u $SERVICE_NAME -f -o cat"
 echo "Summary:  bash $ROOT/scripts/status.sh"
 echo "Watch:    bash $ROOT/scripts/status.sh --watch 5"
