@@ -79,7 +79,7 @@ Directly usable as the input layer for an embeddings worker:
 
 ## Runtime report
 
-Every run generates `data/reports/run-<UTC timestamp>.md` containing measured wall-clock duration, official Oxylabs usage before/after, search/product jobs, faulted jobs, accepted/rejected counts, and the graceful-stop reason.
+Every run generates `data/reports/run-<UTC timestamp>.md` containing measured wall-clock duration, guarded Oxylabs usage before/after, search/product jobs, faulted jobs, accepted/rejected counts, and the graceful-stop reason. The guarded usage is the maximum of provider-reported usage and the scraper's locally observed completed-job floor, because usage statistics can lag on fresh/free accounts.
 
 There is no honest fixed time estimate before running because Oxylabs/Amazon latency varies. Push-Pull batch jobs run asynchronously at Oxylabs; the VPS is not scraping product pages sequentially. The measured run report is authoritative for the actual run.
 
@@ -107,6 +107,7 @@ A search page used to discover ASINs is itself a result. A full `amazon_product`
 ## Error behavior
 
 - `SIGINT` / `SIGTERM`: graceful stop; in-flight wave finishes where possible; files/checkpoint remain valid.
+- VPS/process reboot during a submitted batch: exact in-flight Oxylabs job IDs are persisted before polling and are polled again after restart rather than submitted again.
 - HTTP `429`: exponential retry; documented as unbilled.
 - HTTP `5xx` / network timeout: retry with backoff.
 - HTTP `401`: stop because credentials are invalid.
