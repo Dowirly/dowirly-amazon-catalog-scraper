@@ -102,10 +102,19 @@ class Pipeline:
             self.metrics.unique_candidates = len(merged)
             return merged
 
-        # Search each page as one Oxylabs job. Batch only varies `query`, which follows
-        # the provider's /batch contract; page/sort remain singular per batch.
-        search_chunk_size = 10 if self.config.mode == "test" else 100
+        # Free Trial discovery deliberately uses roughly one query per configured
+        # category per wave. This preserves diversity and avoids wasting dozens of
+        # scarce results after we already have enough ASIN candidates. Micro can use
+        # larger waves for throughput.
+        category_count = len({q.logical_category for q in self.search_plan.queries})
+        if self.config.mode == "test":
+            search_chunk_size = 10
+        elif self.config.plan == "free":
+            search_chunk_size = max(10, category_count)
+        else:
+            search_chunk_size = 100
         query_chunks = [self.search_plan.queries[i : i + search_chunk_size] for i in range(0, len(self.search_plan.queries), search_chunk_size)]
+
         for sort in self.search_plan.sorts:
             for page in range(1, self.search_plan.max_pages_per_query + 1):
                 for chunk_index, chunk in enumerate(query_chunks):
@@ -134,8 +143,6 @@ class Pipeline:
                         if capacity <= 0:
                             raise BudgetExhausted("No result budget left during discovery")
 
-                        # Never spend so much on discovery that there is nothing left to
-                        # enrich. For small target runs reserve at least target count.
                         reserve_for_products = self._product_reserve(len(merged))
                         search_capacity = max(0, capacity - reserve_for_products)
                         if search_capacity <= 0:
@@ -187,8 +194,7 @@ class Pipeline:
                             completed_keys.add(f"sort={sort}|page={page}|query={result.query}")
                     # Commit completion and clear the durable in-flight marker in
                     # one atomic checkpoint write. If the VPS dies before this
-                    # write, the same Oxylabs job IDs are polled again after reboot;
-                    # they are not re-submitted.
+                    # write, the same Oxylabs job IDs are polled again after reboot.
                     self.checkpoint["completed_search_keys"] = sorted(completed_keys)
                     self.checkpoint.setdefault("inflight_jobs", {}).pop("search", None)
                     self.storage.save_checkpoint(self.checkpoint)
@@ -196,7 +202,7 @@ class Pipeline:
                     self.metrics.unique_candidates = len(merged)
                     self._rewrite_unique_candidates(merged)
                     LOGGER.info("Discovery now has %s unique ASIN candidates.", len(merged))
-                    await self.budget.refresh()  # releases capacity from faulted, unbilled jobs
+                    await self.budget.refresh()
                     self._log_progress("discovery")
 
                 if (self.stop_requested.is_set() or len(merged) >= desired) and not (self.checkpoint.get("inflight_jobs") or {}).get("search"):
@@ -209,17 +215,13 @@ class Pipeline:
 
     def _desired_candidate_count(self) -> int:
         if self.config.max_products is not None:
-            # Oversample to absorb missing/invalid product pages without another search pass.
             return max(self.config.max_products + 20, int(self.config.max_products * 1.5))
-        # In maximize mode, aim for enough candidates to consume almost all quota on
-        # product pages, while leaving a small fraction for discovery.
         return max(100, int(self.budget.capacity() * 0.98))
 
     def _product_reserve(self, current_candidates: int) -> int:
         if self.config.max_products is not None:
             remaining_target = max(0, self.config.max_products - len(self.storage.final_asins()))
             return min(self.budget.capacity(), remaining_target)
-        # For maximize mode, reserve the candidates we already have for enrichment.
         return min(self.budget.capacity(), max(25, current_candidates))
 
     def _rewrite_unique_candidates(self, candidates: list[dict[str, Any]]) -> None:
@@ -235,6 +237,7 @@ class Pipeline:
     async def _enrich(self, candidates: list[dict[str, Any]]) -> None:
         candidate_by_asin = {c["asin"]: c for c in candidates}
         existing_final_asins = self.storage.final_asins()
+        existing_embedding_asins = self.storage.embedding_asins()
         self.metrics.accepted_products = len(existing_final_asins)
         completed_asins = set(self.checkpoint.get("completed_product_asins") or []) | existing_final_asins
         queue = [asin for asin in candidate_by_asin if asin not in completed_asins]
@@ -243,7 +246,6 @@ class Pipeline:
             LOGGER.info("No product ASINs left to enrich.")
             return
 
-        # Best discovery candidates first: products seen more often, with image/title/price.
         queue.sort(key=lambda a: self._candidate_score(candidate_by_asin[a]), reverse=True)
         parent_seen: set[str] = set()
         if self.config.dedupe_parent_asin:
@@ -337,11 +339,14 @@ class Pipeline:
                 if parent:
                     parent_seen.add(str(parent))
 
-                # A hard reboot may occur after append+fsync but before the atomic
-                # checkpoint clear. If that exact provider job is replayed on the
-                # next boot, never append a second final product.
+                # Final product and embedding are individually fsynced. On replay,
+                # fill whichever side is missing without duplicating the other.
                 if asin not in existing_final_asins:
                     self.storage.append(self.storage.paths.final_products, norm.product)
+                    existing_final_asins.add(asin)
+                    self.metrics.accepted_products += 1
+
+                if asin not in existing_embedding_asins:
                     self.storage.append(
                         self.storage.paths.embedding_input,
                         {
@@ -356,8 +361,7 @@ class Pipeline:
                             },
                         },
                     )
-                    existing_final_asins.add(asin)
-                    self.metrics.accepted_products += 1
+                    existing_embedding_asins.add(asin)
                 completed_asins.add(asin)
 
             self.checkpoint["completed_product_asins"] = sorted(completed_asins)
@@ -371,13 +375,10 @@ class Pipeline:
     ) -> list[JobResult]:
         """Submit/poll a durable Push-Pull wave and retry only provider faults.
 
-        The submitted Oxylabs job IDs are atomically persisted *before* polling.
-        If Python, SSH, tmux, or the entire VPS dies after submission, a restarted
-        run recognizes the durable phase and resumes polling those exact job IDs
-        rather than paying for duplicate scraping requests.
-
-        In-flight state is intentionally cleared by the caller only after raw/final
-        output plus completed-search/product checkpoint data has been committed.
+        Submitted Oxylabs job IDs are atomically persisted immediately after the
+        provider accepts the batch and before we spend time writing audit events or
+        polling. A restarted process therefore polls those exact IDs rather than
+        paying for duplicate scraping requests.
         """
         inflight_map = self.checkpoint.setdefault("inflight_jobs", {})
         saved = inflight_map.get(phase)
@@ -402,12 +403,11 @@ class Pipeline:
         if not all_jobs:
             jobs = await self.client.submit_batch(payload)
             all_jobs.extend(jobs)
+            # Persist provider job IDs before slower per-job audit fsyncs.
+            self._persist_inflight(phase, signature, payload, all_jobs)
             self._count_new_jobs(phase, jobs)
             self._record_jobs(f"{phase}_submitted", jobs)
-            self._persist_inflight(phase, signature, payload, all_jobs)
 
-        # Once a wave has been submitted, finish/persist it even if SIGTERM was
-        # requested. If the OS kills us first, the durable job IDs are resumed.
         while True:
             results = await self.client.poll_jobs(all_jobs, max_retries=0)
             by_query: dict[str, list[JobResult]] = defaultdict(list)
@@ -430,7 +430,6 @@ class Pipeline:
 
                 faults = [r for r in attempts if r.status == "faulted" or r.result is None]
                 if faults:
-                    # max_job_retries counts extra submissions after the first one.
                     retries_already_used = max(0, jobs_per_query.get(query, 1) - 1)
                     if retries_already_used < self.config.max_job_retries:
                         retry_queries.append(query)
@@ -444,11 +443,7 @@ class Pipeline:
             await self.budget.refresh()
             allowed = self.budget.reserve(len(retry_queries))
             if allowed <= 0:
-                LOGGER.warning(
-                    "No quota headroom remains to retry %s faulted %s jobs.",
-                    len(retry_queries),
-                    phase,
-                )
+                LOGGER.warning("No quota headroom remains to retry %s faulted %s jobs.", len(retry_queries), phase)
                 for query in retry_queries:
                     attempts = by_query.get(query, [])
                     if attempts:
@@ -459,16 +454,13 @@ class Pipeline:
             retry_queries = retry_queries[:allowed]
             retry_payload = dict(payload)
             retry_payload["query"] = retry_queries
-            LOGGER.info(
-                "Retrying %s faulted %s jobs; prior submitted attempts remain durably tracked.",
-                len(retry_queries),
-                phase,
-            )
+            LOGGER.info("Retrying %s faulted %s jobs; prior attempts remain durably tracked.", len(retry_queries), phase)
             retry_jobs = await self.client.submit_batch(retry_payload)
             all_jobs.extend(retry_jobs)
+            # Same ordering as initial submit: checkpoint first, audit second.
+            self._persist_inflight(phase, signature, payload, all_jobs)
             self._count_new_jobs(phase, retry_jobs)
             self._record_jobs(f"{phase}_retry_submitted", retry_jobs)
-            self._persist_inflight(phase, signature, payload, all_jobs)
 
     def _persist_inflight(
         self,
