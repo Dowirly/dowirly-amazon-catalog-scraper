@@ -71,7 +71,22 @@ class OxylabsClient:
             async with semaphore:
                 return await self._poll_one(job, max_retries=max_retries)
 
-        return await asyncio.gather(*(one(job) for job in jobs))
+        total = len(jobs)
+        if total == 0:
+            return []
+        tasks = [asyncio.create_task(one(job)) for job in jobs]
+        results: list[JobResult] = []
+        # Large Push-Pull batches can run for minutes. Emit lightweight polling
+        # progress while they are in flight so journalctl remains useful even
+        # before normalization of the whole batch begins.
+        log_every = max(1, min(50, total // 10 or 1))
+        for future in asyncio.as_completed(tasks):
+            result = await future
+            results.append(result)
+            completed = len(results)
+            if completed == total or completed % log_every == 0:
+                LOGGER.info("POLL | completed_jobs=%s/%s", completed, total)
+        return results
 
     async def _poll_one(self, job: dict[str, Any], *, max_retries: int) -> JobResult:
         current = job
