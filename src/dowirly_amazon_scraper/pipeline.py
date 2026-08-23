@@ -53,7 +53,10 @@ class Pipeline:
                 self.budget.capacity(),
             )
             self._log_progress("startup")
-            if self.budget.capacity() <= 0:
+            # A submitted batch must still be collected even if the provider has
+            # already advanced the visible usage counter to the plan limit.
+            has_inflight = bool(self.checkpoint.get("inflight_jobs"))
+            if self.budget.capacity() <= 0 and not has_inflight:
                 self.metrics.graceful_stop_reason = "result_budget_already_exhausted"
                 return self.metrics
 
@@ -94,7 +97,7 @@ class Pipeline:
         completed_keys = set(self.checkpoint.get("completed_search_keys") or [])
 
         desired = self._desired_candidate_count()
-        if len(merged) >= desired:
+        if len(merged) >= desired and not (self.checkpoint.get("inflight_jobs") or {}).get("search"):
             LOGGER.info("Discovery already has %s candidates; desired=%s. Resuming enrichment.", len(merged), desired)
             self.metrics.unique_candidates = len(merged)
             return merged
@@ -106,51 +109,62 @@ class Pipeline:
         for sort in self.search_plan.sorts:
             for page in range(1, self.search_plan.max_pages_per_query + 1):
                 for chunk_index, chunk in enumerate(query_chunks):
-                    if self.stop_requested.is_set() or len(merged) >= desired:
+                    inflight_search = (self.checkpoint.get("inflight_jobs") or {}).get("search")
+                    if (self.stop_requested.is_set() or len(merged) >= desired) and not inflight_search:
                         break
                     pending_chunk = [
                         q for q in chunk
                         if f"sort={sort}|page={page}|query={q.query}" not in completed_keys
                     ]
-                    if not pending_chunk:
+                    if not pending_chunk and not inflight_search:
                         continue
 
-                    await self.budget.refresh()
-                    capacity = self.budget.capacity()
-                    if capacity <= 0:
-                        raise BudgetExhausted("No result budget left during discovery")
+                    if inflight_search:
+                        # Resume the exact provider-side batch, regardless of whether
+                        # the provider usage counter changed while this VPS was down.
+                        payload = dict(inflight_search.get("payload") or {})
+                        saved_page = int(payload.get("start_page") or 1)
+                        saved_sort = self._payload_context_value(payload, "sort_by") or "featured"
+                        if saved_page != page or saved_sort != sort:
+                            continue
+                        LOGGER.warning("Found durable in-flight search batch; resuming it before any new search submission.")
+                    else:
+                        await self.budget.refresh()
+                        capacity = self.budget.capacity()
+                        if capacity <= 0:
+                            raise BudgetExhausted("No result budget left during discovery")
 
-                    # Never spend so much on discovery that there is nothing left to
-                    # enrich. For small target runs reserve at least target count.
-                    reserve_for_products = self._product_reserve(len(merged))
-                    search_capacity = max(0, capacity - reserve_for_products)
-                    if search_capacity <= 0:
-                        LOGGER.info("Stopping discovery to preserve %s result slots for product pages.", reserve_for_products)
-                        self.metrics.graceful_stop_reason = self.metrics.graceful_stop_reason or "discovery_budget_reserve_reached"
-                        self.metrics.unique_candidates = len(merged)
-                        return merged
+                        # Never spend so much on discovery that there is nothing left to
+                        # enrich. For small target runs reserve at least target count.
+                        reserve_for_products = self._product_reserve(len(merged))
+                        search_capacity = max(0, capacity - reserve_for_products)
+                        if search_capacity <= 0:
+                            LOGGER.info("Stopping discovery to preserve %s result slots for product pages.", reserve_for_products)
+                            self.metrics.graceful_stop_reason = self.metrics.graceful_stop_reason or "discovery_budget_reserve_reached"
+                            self.metrics.unique_candidates = len(merged)
+                            return merged
 
-                    selected = pending_chunk[: min(len(pending_chunk), search_capacity)]
-                    if not selected:
-                        return merged
-                    payload = base_payload(self.config, "amazon_search")
-                    payload.update(
-                        {
-                            "query": [q.query for q in selected],
-                            "start_page": page,
-                            "pages": 1,
-                            "context": [
-                                {"key": "currency", "value": "SAR"},
-                                {"key": "sort_by", "value": sort},
-                            ],
-                        }
-                    )
-                    allowed = self.budget.reserve(len(selected))
-                    payload["query"] = payload["query"][:allowed]
-                    if not payload["query"]:
-                        raise BudgetExhausted("No safe capacity for another search batch")
+                        selected = pending_chunk[: min(len(pending_chunk), search_capacity)]
+                        if not selected:
+                            return merged
+                        payload = base_payload(self.config, "amazon_search")
+                        payload.update(
+                            {
+                                "query": [q.query for q in selected],
+                                "start_page": page,
+                                "pages": 1,
+                                "context": [
+                                    {"key": "currency", "value": "SAR"},
+                                    {"key": "sort_by", "value": sort},
+                                ],
+                            }
+                        )
+                        allowed = self.budget.reserve(len(selected))
+                        payload["query"] = payload["query"][:allowed]
+                        if not payload["query"]:
+                            raise BudgetExhausted("No safe capacity for another search batch")
 
-                    LOGGER.info("Submitting search batch: %s jobs (sort=%s page=%s)", len(payload["query"]), sort, page)
+                    LOGGER.info("Submitting/resuming search batch: %s jobs (sort=%s page=%s)", len(payload.get("query") or []), sort, page)
                     results = await self._submit_and_poll_with_fault_retries(payload, phase="search")
                     for result in results:
                         if result.status == "faulted" or result.result is None:
@@ -185,9 +199,9 @@ class Pipeline:
                     await self.budget.refresh()  # releases capacity from faulted, unbilled jobs
                     self._log_progress("discovery")
 
-                if self.stop_requested.is_set() or len(merged) >= desired:
+                if (self.stop_requested.is_set() or len(merged) >= desired) and not (self.checkpoint.get("inflight_jobs") or {}).get("search"):
                     break
-            if self.stop_requested.is_set() or len(merged) >= desired:
+            if (self.stop_requested.is_set() or len(merged) >= desired) and not (self.checkpoint.get("inflight_jobs") or {}).get("search"):
                 break
 
         self._rewrite_unique_candidates(merged)
@@ -224,7 +238,8 @@ class Pipeline:
         self.metrics.accepted_products = len(existing_final_asins)
         completed_asins = set(self.checkpoint.get("completed_product_asins") or []) | existing_final_asins
         queue = [asin for asin in candidate_by_asin if asin not in completed_asins]
-        if not queue:
+        inflight_product = (self.checkpoint.get("inflight_jobs") or {}).get("product")
+        if not queue and not inflight_product:
             LOGGER.info("No product ASINs left to enrich.")
             return
 
@@ -238,40 +253,52 @@ class Pipeline:
                     parent_seen.add(str(parent))
 
         index = 0
-        while index < len(queue) and not self.stop_requested.is_set():
-            if self.config.max_products is not None and self.metrics.accepted_products >= self.config.max_products:
+        while (index < len(queue) or (self.checkpoint.get("inflight_jobs") or {}).get("product")) and not self.stop_requested.is_set():
+            while index < len(queue) and queue[index] in completed_asins:
+                index += 1
+
+            inflight_product = (self.checkpoint.get("inflight_jobs") or {}).get("product")
+            if self.config.max_products is not None and self.metrics.accepted_products >= self.config.max_products and not inflight_product:
                 self.metrics.graceful_stop_reason = self.metrics.graceful_stop_reason or "requested_product_limit_reached"
                 break
 
-            await self.budget.refresh()
-            capacity = self.budget.capacity()
-            if capacity <= 0:
-                raise BudgetExhausted("Oxylabs result budget reached during product enrichment")
+            if inflight_product:
+                payload = dict(inflight_product.get("payload") or {})
+                asins = [str(v).upper() for v in payload.get("query") or []]
+                LOGGER.warning("Found durable in-flight product batch; resuming %s ASIN jobs before any new submission.", len(asins))
+            else:
+                if index >= len(queue):
+                    break
+                await self.budget.refresh()
+                capacity = self.budget.capacity()
+                if capacity <= 0:
+                    raise BudgetExhausted("Oxylabs result budget reached during product enrichment")
 
-            remaining_target = (
-                self.config.max_products - self.metrics.accepted_products
-                if self.config.max_products is not None
-                else capacity
-            )
-            take = min(self.config.batch_size, capacity, max(0, remaining_target), len(queue) - index)
-            if take <= 0:
-                break
-            asins = queue[index : index + take]
-            index += take
+                remaining_target = (
+                    self.config.max_products - self.metrics.accepted_products
+                    if self.config.max_products is not None
+                    else capacity
+                )
+                take = min(self.config.batch_size, capacity, max(0, remaining_target), len(queue) - index)
+                if take <= 0:
+                    break
+                asins = queue[index : index + take]
+                index += take
 
-            payload = base_payload(self.config, "amazon_product")
-            payload.update(
-                {
-                    "query": asins,
-                    "context": [
-                        {"key": "currency", "value": "SAR"},
-                        {"key": "autoselect_variant", "value": True},
-                    ],
-                }
-            )
-            allowed = self.budget.reserve(len(asins))
-            payload["query"] = payload["query"][:allowed]
-            LOGGER.info("Submitting product batch: %s ASINs", len(payload["query"]))
+                payload = base_payload(self.config, "amazon_product")
+                payload.update(
+                    {
+                        "query": asins,
+                        "context": [
+                            {"key": "currency", "value": "SAR"},
+                            {"key": "autoselect_variant", "value": True},
+                        ],
+                    }
+                )
+                allowed = self.budget.reserve(len(asins))
+                payload["query"] = payload["query"][:allowed]
+
+            LOGGER.info("Submitting/resuming product batch: %s ASINs", len(payload.get("query") or []))
             results = await self._submit_and_poll_with_fault_retries(payload, phase="product")
 
             for result in results:
@@ -310,22 +337,27 @@ class Pipeline:
                 if parent:
                     parent_seen.add(str(parent))
 
-                self.storage.append(self.storage.paths.final_products, norm.product)
-                self.storage.append(
-                    self.storage.paths.embedding_input,
-                    {
-                        "id": norm.product["id"],
-                        "external_id": norm.product["external_id"],
-                        "text": norm.product["embedding_text"],
-                        "metadata": {
-                            "source": "amazon",
-                            "marketplace": "amazon.sa",
-                            "category": norm.product["category"],
-                            "brand": norm.product.get("brand"),
+                # A hard reboot may occur after append+fsync but before the atomic
+                # checkpoint clear. If that exact provider job is replayed on the
+                # next boot, never append a second final product.
+                if asin not in existing_final_asins:
+                    self.storage.append(self.storage.paths.final_products, norm.product)
+                    self.storage.append(
+                        self.storage.paths.embedding_input,
+                        {
+                            "id": norm.product["id"],
+                            "external_id": norm.product["external_id"],
+                            "text": norm.product["embedding_text"],
+                            "metadata": {
+                                "source": "amazon",
+                                "marketplace": "amazon.sa",
+                                "category": norm.product["category"],
+                                "brand": norm.product.get("brand"),
+                            },
                         },
-                    },
-                )
-                self.metrics.accepted_products += 1
+                    )
+                    existing_final_asins.add(asin)
+                    self.metrics.accepted_products += 1
                 completed_asins.add(asin)
 
             self.checkpoint["completed_product_asins"] = sorted(completed_asins)
@@ -341,34 +373,31 @@ class Pipeline:
 
         The submitted Oxylabs job IDs are atomically persisted *before* polling.
         If Python, SSH, tmux, or the entire VPS dies after submission, a restarted
-        run recognizes the same deterministic payload and resumes polling those
-        exact job IDs rather than paying for duplicate scraping requests.
+        run recognizes the durable phase and resumes polling those exact job IDs
+        rather than paying for duplicate scraping requests.
 
         In-flight state is intentionally cleared by the caller only after raw/final
         output plus completed-search/product checkpoint data has been committed.
         """
-        original_queries = [str(v) for v in payload.get("query") or []]
-        if not original_queries:
-            return []
-
-        signature = self._payload_signature(payload)
         inflight_map = self.checkpoint.setdefault("inflight_jobs", {})
         saved = inflight_map.get(phase)
         all_jobs: list[dict[str, Any]] = []
 
         if saved:
-            if saved.get("signature") != signature:
-                raise OxylabsError(
-                    f"Durable in-flight {phase} batch does not match the next deterministic batch. "
-                    "Run the same command/config that was active before the interruption, or inspect "
-                    "data/intermediate/checkpoint.json before changing discovery settings."
-                )
+            saved_payload = dict(saved.get("payload") or {})
+            if saved_payload:
+                payload = saved_payload
             all_jobs = list(saved.get("jobs") or [])
             LOGGER.warning(
                 "RESUME | phase=%s | polling %s previously submitted Oxylabs jobs; no duplicate submit",
                 phase,
                 len(all_jobs),
             )
+
+        original_queries = [str(v) for v in payload.get("query") or []]
+        if not original_queries:
+            return []
+        signature = str((saved or {}).get("signature") or self._payload_signature(payload))
 
         if not all_jobs:
             jobs = await self.client.submit_batch(payload)
@@ -441,8 +470,6 @@ class Pipeline:
             self._record_jobs(f"{phase}_retry_submitted", retry_jobs)
             self._persist_inflight(phase, signature, payload, all_jobs)
 
-        return []
-
     def _persist_inflight(
         self,
         phase: str,
@@ -462,6 +489,13 @@ class Pipeline:
     def _payload_signature(payload: dict[str, Any]) -> str:
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _payload_context_value(payload: dict[str, Any], key: str) -> Any:
+        for item in payload.get("context") or []:
+            if isinstance(item, dict) and item.get("key") == key:
+                return item.get("value")
+        return None
 
     def _count_new_jobs(self, phase: str, jobs: list[dict[str, Any]]) -> None:
         if phase == "search":
