@@ -21,10 +21,14 @@ See [RUN.md](RUN.md) for VPS commands and [REPORT.md](REPORT.md) for output/sche
 ## Safety / resilience
 
 - Official Oxylabs usage statistics are read before each submission wave.
+- A locally persisted completed-job floor protects the quota when provider usage statistics lag.
 - Every job requests exactly one target page, making quota reservation deterministic.
-- Batches finish before usage is refreshed; faulted/unbilled jobs return capacity on the next wave.
 - Raw records are append-only JSONL and flushed/fsynced immediately.
 - Atomic checkpoint permits restart with the same command.
+- Submitted in-flight Oxylabs job IDs are checkpointed before polling, so a reboot resumes the same jobs instead of re-submitting them.
+- Discovery queries are consumed round-robin across configured categories so small quotas stay diverse.
+- `scripts/install_systemd.sh` can auto-start/resume the scraper after a VPS reboot.
+- `scripts/status.sh` plus `PROGRESS` / `POLL` logs provide live monitoring.
 - SIGINT/SIGTERM causes a graceful stop after in-flight work; collected data remains on disk.
 - HTTP 429/5xx/network failures are retried with backoff.
 - 2xx/4xx target results are treated as potentially billable, matching Oxylabs billing documentation.
