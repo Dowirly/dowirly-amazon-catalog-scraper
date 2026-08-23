@@ -66,7 +66,7 @@ PY
 
   if command -v journalctl >/dev/null 2>&1; then
     local latest
-    latest="$(journalctl -u "$SERVICE" -n 400 --no-pager -o cat 2>/dev/null | grep -E 'WAVE \||RESUME \||SUBMIT \||SUBMIT_RATE_ADAPT \||POLL \||PROGRESS \||PROVIDER_STOP' | tail -n 1 || true)"
+    latest="$(journalctl -u "$SERVICE" -n 400 --no-pager -o cat 2>/dev/null | grep -E 'WAVE \||RESUME \||SUBMIT \||SUBMIT_RATE_ADAPT \||SUBMIT_RATE_PROBE \||SUBMIT_COOLDOWN \||POLL \||PROGRESS \||PROVIDER_STOP' | tail -n 1 || true)"
     if [[ -n "$latest" ]]; then
       echo
       echo "Latest scraper activity:"
