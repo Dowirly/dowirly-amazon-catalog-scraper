@@ -22,7 +22,7 @@ count_lines() {
 }
 
 render() {
-  local accepted rejected candidates discovered raw_products raw_search
+  local accepted rejected candidates discovered raw_products raw_search service_state
   accepted="$(count_lines "$DATA_DIR/final/products.jsonl")"
   rejected="$(count_lines "$DATA_DIR/intermediate/rejected_products.jsonl")"
   candidates="$(count_lines "$DATA_DIR/intermediate/unique_candidates.jsonl")"
@@ -58,8 +58,10 @@ else:
 PY
   fi
 
+  service_state="unknown"
   if command -v systemctl >/dev/null 2>&1; then
-    echo "Service state          : $(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    service_state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    echo "Service state          : $service_state"
   fi
 
   if command -v journalctl >/dev/null 2>&1; then
@@ -69,6 +71,16 @@ PY
       echo
       echo "Latest progress log:"
       echo "$latest"
+    fi
+
+    if [[ "$service_state" == "failed" ]]; then
+      local last_error
+      last_error="$(journalctl -u "$SERVICE" -n 120 --no-pager -o cat 2>/dev/null | grep -E 'ERROR|Traceback|RATE_LIMIT|failed|Failed' | tail -n 8 || true)"
+      if [[ -n "$last_error" ]]; then
+        echo
+        echo "Recent failure details:"
+        echo "$last_error"
+      fi
     fi
   fi
 }
