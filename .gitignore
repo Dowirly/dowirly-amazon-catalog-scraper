@@ -1,0 +1,21 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.DS_Store
+
+# Runtime data can be large and may contain copyrighted marketplace content.
+data/raw/*
+data/intermediate/*
+data/final/*
+data/reports/*
+logs/*
+
+# Keep directories in git.
+!data/raw/.gitkeep
+!data/intermediate/.gitkeep
+!data/final/.gitkeep
+!data/reports/.gitkeep
+!logs/.gitkeep
