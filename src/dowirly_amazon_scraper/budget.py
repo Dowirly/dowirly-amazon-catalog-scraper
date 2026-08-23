@@ -9,7 +9,9 @@ from .config import AppConfig
 
 @dataclass(slots=True)
 class UsageSnapshot:
+    # all_count is the guarded effective count: max(provider stats, local floor).
     all_count: int
+    provider_count: int
     raw: dict[str, Any]
 
 
@@ -26,18 +28,29 @@ class BudgetGuard:
     (unbilled) jobs return capacity without risking an overrun.
     """
 
-    def __init__(self, config: AppConfig, client: Any) -> None:
+    def __init__(self, config: AppConfig, client: Any, *, local_floor: int = 0) -> None:
         self.config = config
         self.client = client
-        self.snapshot = UsageSnapshot(0, {})
+        self.local_floor = max(0, int(local_floor))
+        self.snapshot = UsageSnapshot(self.local_floor, 0, {})
         self.pending_reserved = 0
 
     async def refresh(self) -> UsageSnapshot:
         raw = await self.client.get_usage_stats(self.config.plan)
-        all_count = self._extract_count(raw)
-        self.snapshot = UsageSnapshot(all_count=all_count, raw=raw)
+        provider_count = self._extract_count(raw)
+        all_count = max(provider_count, self.local_floor)
+        self.snapshot = UsageSnapshot(all_count=all_count, provider_count=provider_count, raw=raw)
         self.pending_reserved = 0
         return self.snapshot
+
+    def set_local_floor(self, count: int) -> None:
+        self.local_floor = max(self.local_floor, max(0, int(count)))
+        if self.snapshot.all_count < self.local_floor:
+            self.snapshot = UsageSnapshot(
+                all_count=self.local_floor,
+                provider_count=self.snapshot.provider_count,
+                raw=self.snapshot.raw,
+            )
 
     def capacity(self) -> int:
         return max(0, self.config.hard_result_limit - self.snapshot.all_count - self.pending_reserved)
