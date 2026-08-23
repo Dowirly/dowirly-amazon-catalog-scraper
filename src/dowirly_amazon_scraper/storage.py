@@ -63,11 +63,22 @@ class Storage:
 
     def load_checkpoint(self) -> dict[str, Any]:
         p = self.paths.checkpoint
+        checkpoint: dict[str, Any]
         if not p.exists():
-            return {"version": 1, "completed_search_keys": [], "completed_product_asins": [], "submitted_jobs": {}}
-        import json
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            checkpoint = {}
+        else:
+            import json
+            with p.open("r", encoding="utf-8") as f:
+                checkpoint = json.load(f)
+
+        # Version 2 adds durable in-flight Oxylabs jobs. setdefault keeps old
+        # checkpoints fully compatible when users pull this update mid-project.
+        checkpoint.setdefault("version", 2)
+        checkpoint["version"] = max(2, int(checkpoint.get("version") or 0))
+        checkpoint.setdefault("completed_search_keys", [])
+        checkpoint.setdefault("completed_product_asins", [])
+        checkpoint.setdefault("inflight_jobs", {})
+        return checkpoint
 
     def save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         atomic_write_json(self.paths.checkpoint, checkpoint)
@@ -77,3 +88,18 @@ class Storage:
 
     def final_asins(self) -> set[str]:
         return {str(r.get("external_id")) for r in read_jsonl(self.paths.final_products) if r.get("external_id")}
+
+    def completed_billable_job_ids(self) -> set[str]:
+        """Return locally observed completed Oxylabs job IDs.
+
+        The provider usage endpoint can lag on fresh/free accounts. Completed
+        Push-Pull jobs are therefore also used as a conservative local usage floor.
+        `faulted` jobs are intentionally excluded because Oxylabs documents them
+        as unbilled.
+        """
+        ids: set[str] = set()
+        for record in read_jsonl(self.paths.raw_jobs):
+            event = str(record.get("event") or "")
+            if event.endswith("_completed") and record.get("status") == "done" and record.get("job_id"):
+                ids.add(str(record["job_id"]))
+        return ids
