@@ -3,9 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from .config import PLAN_AMAZON_PRICE_PER_1K_USD, PLAN_BASE_PRICE_USD, AppConfig
+from .config import AppConfig
 from .utils import utc_now_iso
 
 
@@ -32,9 +31,18 @@ class RunMetrics:
 
 def write_run_report(path: Path, config: AppConfig, metrics: RunMetrics) -> None:
     delta = max(0, metrics.usage_after - metrics.usage_before)
-    variable_equivalent = delta / 1000 * PLAN_AMAZON_PRICE_PER_1K_USD[config.plan]
-    base = PLAN_BASE_PRICE_USD[config.plan]
     duration = _duration(metrics.elapsed_seconds)
+    configured_limit = (
+        f"{config.max_results:,}"
+        if config.max_results is not None
+        else "provider-managed / no local result cap"
+    )
+    max_products = (
+        str(config.max_products)
+        if config.max_products is not None
+        else "unbounded until provider/search exhaustion"
+    )
+
     text = f"""# Scrape Run Report
 
 Generated: {utc_now_iso()}
@@ -42,29 +50,31 @@ Generated: {utc_now_iso()}
 ## Run
 
 - Mode: `{config.mode}`
-- Plan guard: `{config.plan}`
-- Hard result limit: `{config.hard_result_limit:,}`
-- Max requested final products: `{config.max_products if config.max_products is not None else 'maximize within budget'}`
+- Local result ceiling: `{configured_limit}`
+- Max requested final products: `{max_products}`
+- Product wave size: **{config.wave_size:,}**
+- Search wave size: **{config.search_wave_size:,}**
+- Submission probe ceiling: **{config.submit_rate:,} jobs/s** (automatically reduced on HTTP 429)
 - Wall-clock duration: **{duration}**
-- Graceful stop reason: `{metrics.graceful_stop_reason or 'completed normally'}`
+- Stop reason: `{metrics.graceful_stop_reason or 'completed normally'}`
 
-## Oxylabs usage
+## Oxylabs usage observed
 
 - Usage before run: **{metrics.usage_before:,} results**
 - Usage after run: **{metrics.usage_after:,} results**
 - Usage delta: **{delta:,} results**
-- Search jobs submitted: **{metrics.search_jobs:,}**
-- Product jobs submitted: **{metrics.product_jobs:,}**
+- Search jobs submitted this run: **{metrics.search_jobs:,}**
+- Product jobs submitted this run: **{metrics.product_jobs:,}**
 - Faulted jobs observed: **{metrics.faulted_jobs:,}**
 
-Oxylabs documents Amazon no-JS pricing at $0.50/1,000 results on Micro, with a $49 monthly minimum. Free Trial is $0 up to 2,000 results. The variable-equivalent value for this run is **${variable_equivalent:.2f}**; plan base price is **${base:.2f}** before any applicable VAT. The script does not purchase plans or top-ups.
+The scraper does not encode or assume a named Oxylabs plan. If `--max-results` is omitted, provider-side quota/subscription enforcement is authoritative. Product work is submitted and saved in bounded waves so already downloaded results remain usable even if later work is refused.
 
 ## Catalog
 
-- Discovery records: **{metrics.discovered_records:,}**
-- Unique ASIN candidates: **{metrics.unique_candidates:,}**
+- Discovery records added this run: **{metrics.discovered_records:,}**
+- Unique ASIN candidates observed: **{metrics.unique_candidates:,}**
 - Accepted normalized products: **{metrics.accepted_products:,}**
-- Rejected products: **{metrics.rejected_products:,}**
+- Rejected products this run: **{metrics.rejected_products:,}**
 
 ## Output files
 
@@ -74,11 +84,9 @@ Oxylabs documents Amazon no-JS pricing at $0.50/1,000 results on Micro, with a $
 - `intermediate/discovered_products.jsonl` — every ASIN occurrence discovered in searches.
 - `intermediate/unique_candidates.jsonl` — deduplicated ASIN candidates and discovery evidence.
 - `intermediate/rejected_products.jsonl` — invalid/low-quality product responses and rejection reasons.
-- `intermediate/checkpoint.json` — atomic resume checkpoint.
+- `intermediate/checkpoint.json` — atomic resume checkpoint, including provider-side in-flight jobs.
 - `final/products.jsonl` — normalized full product models.
-- `final/embedding_input.jsonl` — compact records ready to send to an embeddings provider.
-
-See the repository `REPORT.md` for the field-level schema and billing notes.
+- `final/embedding_input.jsonl` — compact records ready for an embeddings provider.
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
