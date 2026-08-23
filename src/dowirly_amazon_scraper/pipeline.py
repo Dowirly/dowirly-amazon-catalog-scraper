@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -13,7 +15,7 @@ from .normalization import extract_parsed_product, normalize_product
 from .oxylabs import JobResult, OxylabsClient, OxylabsError, OxylabsQuotaStop, base_payload
 from .reporting import RunMetrics, write_run_report
 from .storage import Storage
-from .utils import append_jsonl, read_jsonl, utc_now_iso
+from .utils import append_jsonl, count_jsonl, read_jsonl, utc_now_iso
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,7 +26,11 @@ class Pipeline:
         self.search_plan = search_plan
         self.storage = Storage(config.data_dir)
         self.client = OxylabsClient(config)
-        self.budget = BudgetGuard(config, self.client)
+        # Provider usage statistics can lag on new/free accounts. The locally
+        # persisted completed-job audit trail is a conservative floor, so a reboot
+        # or delayed provider counter cannot make us overspend our configured plan.
+        self.billable_job_ids = self.storage.completed_billable_job_ids()
+        self.budget = BudgetGuard(config, self.client, local_floor=len(self.billable_job_ids))
         self.metrics = RunMetrics()
         self.stop_requested = asyncio.Event()
         self.checkpoint = self.storage.load_checkpoint()
@@ -39,11 +45,14 @@ class Pipeline:
             before = await self.budget.refresh()
             self.metrics.usage_before = before.all_count
             LOGGER.info(
-                "Oxylabs usage: %s / %s results; remaining guarded capacity=%s",
+                "Oxylabs guarded usage: %s / %s results (provider=%s, local_floor=%s); remaining=%s",
                 before.all_count,
                 self.config.hard_result_limit,
+                before.provider_count,
+                len(self.billable_job_ids),
                 self.budget.capacity(),
             )
+            self._log_progress("startup")
             if self.budget.capacity() <= 0:
                 self.metrics.graceful_stop_reason = "result_budget_already_exhausted"
                 return self.metrics
@@ -70,6 +79,7 @@ class Pipeline:
             self.metrics.finished_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
             report_name = self.metrics.started_at.strftime("run-%Y%m%dT%H%M%SZ.md")
             write_run_report(self.storage.paths.report_dir / report_name, self.config, self.metrics)
+            self._log_progress("finished")
             await self.client.close()
 
     def request_stop(self, reason: str) -> None:
@@ -161,13 +171,19 @@ class Pipeline:
                     for result in results:
                         if result.status == "done" and result.result is not None:
                             completed_keys.add(f"sort={sort}|page={page}|query={result.query}")
+                    # Commit completion and clear the durable in-flight marker in
+                    # one atomic checkpoint write. If the VPS dies before this
+                    # write, the same Oxylabs job IDs are polled again after reboot;
+                    # they are not re-submitted.
                     self.checkpoint["completed_search_keys"] = sorted(completed_keys)
+                    self.checkpoint.setdefault("inflight_jobs", {}).pop("search", None)
                     self.storage.save_checkpoint(self.checkpoint)
                     merged = merge_candidates(read_jsonl(self.storage.paths.discovered))
                     self.metrics.unique_candidates = len(merged)
                     self._rewrite_unique_candidates(merged)
                     LOGGER.info("Discovery now has %s unique ASIN candidates.", len(merged))
                     await self.budget.refresh()  # releases capacity from faulted, unbilled jobs
+                    self._log_progress("discovery")
 
                 if self.stop_requested.is_set() or len(merged) >= desired:
                     break
@@ -313,72 +329,171 @@ class Pipeline:
                 completed_asins.add(asin)
 
             self.checkpoint["completed_product_asins"] = sorted(completed_asins)
+            self.checkpoint.setdefault("inflight_jobs", {}).pop("product", None)
             self.storage.save_checkpoint(self.checkpoint)
             await self.budget.refresh()
-            LOGGER.info(
-                "Enrichment progress: accepted=%s rejected=%s usage=%s/%s",
-                self.metrics.accepted_products,
-                self.metrics.rejected_products,
-                self.budget.snapshot.all_count,
-                self.config.hard_result_limit,
-            )
-
+            self._log_progress("enrichment")
 
     async def _submit_and_poll_with_fault_retries(
         self, payload: dict[str, Any], *, phase: str
     ) -> list[JobResult]:
-        """Submit a Push-Pull batch and retry only provider-faulted jobs.
+        """Submit/poll a durable Push-Pull wave and retry only provider faults.
 
-        Oxylabs documents `faulted` jobs as unbilled. We therefore refresh the
-        official usage counter before each retry wave and only resubmit faulted
-        query values that still fit inside the configured hard result guard.
-        Successful jobs are never submitted twice.
+        The submitted Oxylabs job IDs are atomically persisted *before* polling.
+        If Python, SSH, tmux, or the entire VPS dies after submission, a restarted
+        run recognizes the same deterministic payload and resumes polling those
+        exact job IDs rather than paying for duplicate scraping requests.
+
+        In-flight state is intentionally cleared by the caller only after raw/final
+        output plus completed-search/product checkpoint data has been committed.
         """
-        pending = [str(v) for v in payload.get("query") or []]
-        finished: list[JobResult] = []
-        attempt = 0
+        original_queries = [str(v) for v in payload.get("query") or []]
+        if not original_queries:
+            return []
 
-        while pending and not self.stop_requested.is_set():
-            if attempt > 0:
-                await self.budget.refresh()
-                allowed = self.budget.reserve(len(pending))
-                if allowed <= 0:
-                    LOGGER.warning("No quota headroom remains to retry %s faulted %s jobs.", len(pending), phase)
-                    break
-                pending = pending[:allowed]
-                LOGGER.info("Retrying %s faulted %s jobs (retry %s/%s).", len(pending), phase, attempt, self.config.max_job_retries)
+        signature = self._payload_signature(payload)
+        inflight_map = self.checkpoint.setdefault("inflight_jobs", {})
+        saved = inflight_map.get(phase)
+        all_jobs: list[dict[str, Any]] = []
 
-            wave_payload = dict(payload)
-            wave_payload["query"] = pending
-            jobs = await self.client.submit_batch(wave_payload)
-            if phase == "search":
-                self.metrics.search_jobs += len(jobs)
-            else:
-                self.metrics.product_jobs += len(jobs)
+        if saved:
+            if saved.get("signature") != signature:
+                raise OxylabsError(
+                    f"Durable in-flight {phase} batch does not match the next deterministic batch. "
+                    "Run the same command/config that was active before the interruption, or inspect "
+                    "data/intermediate/checkpoint.json before changing discovery settings."
+                )
+            all_jobs = list(saved.get("jobs") or [])
+            LOGGER.warning(
+                "RESUME | phase=%s | polling %s previously submitted Oxylabs jobs; no duplicate submit",
+                phase,
+                len(all_jobs),
+            )
+
+        if not all_jobs:
+            jobs = await self.client.submit_batch(payload)
+            all_jobs.extend(jobs)
+            self._count_new_jobs(phase, jobs)
             self._record_jobs(f"{phase}_submitted", jobs)
+            self._persist_inflight(phase, signature, payload, all_jobs)
 
-            results = await self.client.poll_jobs(jobs, max_retries=0)
-            retry_queries: list[str] = []
-            final_faults: list[JobResult] = []
+        # Once a wave has been submitted, finish/persist it even if SIGTERM was
+        # requested. If the OS kills us first, the durable job IDs are resumed.
+        while True:
+            results = await self.client.poll_jobs(all_jobs, max_retries=0)
+            by_query: dict[str, list[JobResult]] = defaultdict(list)
             for result in results:
+                by_query[result.query].append(result)
                 self._record_job_result(result, phase)
-                if result.status == "faulted" or result.result is None:
-                    self.metrics.faulted_jobs += 1
-                    if attempt < self.config.max_job_retries:
-                        retry_queries.append(result.query)
+
+            selected_results: list[JobResult] = []
+            retry_queries: list[str] = []
+            jobs_per_query: dict[str, int] = defaultdict(int)
+            for job in all_jobs:
+                jobs_per_query[str(job.get("query") or job.get("url") or "")] += 1
+
+            for query in original_queries:
+                attempts = by_query.get(query, [])
+                successes = [r for r in attempts if r.status == "done" and r.result is not None]
+                if successes:
+                    selected_results.append(successes[-1])
+                    continue
+
+                faults = [r for r in attempts if r.status == "faulted" or r.result is None]
+                if faults:
+                    # max_job_retries counts extra submissions after the first one.
+                    retries_already_used = max(0, jobs_per_query.get(query, 1) - 1)
+                    if retries_already_used < self.config.max_job_retries:
+                        retry_queries.append(query)
                     else:
-                        final_faults.append(result)
-                else:
-                    finished.append(result)
+                        selected_results.append(faults[-1])
+                        self.metrics.faulted_jobs += 1
 
             if not retry_queries:
-                finished.extend(final_faults)
-                break
+                return selected_results
 
-            pending = retry_queries
-            attempt += 1
+            await self.budget.refresh()
+            allowed = self.budget.reserve(len(retry_queries))
+            if allowed <= 0:
+                LOGGER.warning(
+                    "No quota headroom remains to retry %s faulted %s jobs.",
+                    len(retry_queries),
+                    phase,
+                )
+                for query in retry_queries:
+                    attempts = by_query.get(query, [])
+                    if attempts:
+                        selected_results.append(attempts[-1])
+                        self.metrics.faulted_jobs += 1
+                return selected_results
 
-        return finished
+            retry_queries = retry_queries[:allowed]
+            retry_payload = dict(payload)
+            retry_payload["query"] = retry_queries
+            LOGGER.info(
+                "Retrying %s faulted %s jobs; prior submitted attempts remain durably tracked.",
+                len(retry_queries),
+                phase,
+            )
+            retry_jobs = await self.client.submit_batch(retry_payload)
+            all_jobs.extend(retry_jobs)
+            self._count_new_jobs(phase, retry_jobs)
+            self._record_jobs(f"{phase}_retry_submitted", retry_jobs)
+            self._persist_inflight(phase, signature, payload, all_jobs)
+
+        return []
+
+    def _persist_inflight(
+        self,
+        phase: str,
+        signature: str,
+        payload: dict[str, Any],
+        jobs: list[dict[str, Any]],
+    ) -> None:
+        self.checkpoint.setdefault("inflight_jobs", {})[phase] = {
+            "signature": signature,
+            "payload": payload,
+            "jobs": jobs,
+            "updated_at": utc_now_iso(),
+        }
+        self.storage.save_checkpoint(self.checkpoint)
+
+    @staticmethod
+    def _payload_signature(payload: dict[str, Any]) -> str:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _count_new_jobs(self, phase: str, jobs: list[dict[str, Any]]) -> None:
+        if phase == "search":
+            self.metrics.search_jobs += len(jobs)
+        else:
+            self.metrics.product_jobs += len(jobs)
+
+    def _log_progress(self, stage: str) -> None:
+        accepted = count_jsonl(self.storage.paths.final_products)
+        rejected = count_jsonl(self.storage.paths.rejected)
+        discovered = count_jsonl(self.storage.paths.discovered)
+        candidates = count_jsonl(self.storage.paths.unique_candidates)
+        inflight = sum(
+            len((record or {}).get("jobs") or [])
+            for record in (self.checkpoint.get("inflight_jobs") or {}).values()
+        )
+        LOGGER.info(
+            "PROGRESS | stage=%s | accepted=%s | rejected=%s | candidates=%s | discovered=%s "
+            "| search_jobs_this_run=%s | product_jobs_this_run=%s | usage=%s/%s "
+            "| provider_usage=%s | inflight_jobs=%s",
+            stage,
+            accepted,
+            rejected,
+            candidates,
+            discovered,
+            self.metrics.search_jobs,
+            self.metrics.product_jobs,
+            self.budget.snapshot.all_count,
+            self.config.hard_result_limit,
+            self.budget.snapshot.provider_count,
+            inflight,
+        )
 
     def _reject(self, asin: str, reasons: list[str], result: JobResult) -> None:
         self.metrics.rejected_products += 1
@@ -406,6 +521,9 @@ class Pipeline:
                 "metadata": result.metadata,
             },
         )
+        if result.status == "done":
+            self.billable_job_ids.add(result.job_id)
+            self.budget.set_local_floor(len(self.billable_job_ids))
 
     @staticmethod
     def _candidate_score(candidate: dict[str, Any]) -> int:
