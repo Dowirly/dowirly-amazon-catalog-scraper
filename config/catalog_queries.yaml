@@ -1,0 +1,270 @@
+# Broad Saudi retail seed catalog. Final category comes from the Amazon product page
+# breadcrumb, not from these labels. Edit this file to focus on specific categories.
+max_pages_per_query: 6
+sorts:
+  - featured
+  - bestsellers
+  - average_review
+  - price_low_to_high
+  - price_high_to_low
+
+categories:
+  - name: Mobile Phones & Accessories
+    queries:
+      - iphone
+      - samsung galaxy phone
+      - android smartphone
+      - budget smartphone
+      - flagship smartphone
+      - mobile phone case
+      - screen protector
+      - magsafe charger
+      - usb c phone charger
+      - lightning cable
+      - phone holder
+      - car phone mount
+      - power bank
+      - wireless charger
+
+  - name: Computers & Accessories
+    queries:
+      - laptop
+      - gaming laptop
+      - ultrabook
+      - tablet
+      - ipad accessories
+      - computer monitor
+      - gaming monitor
+      - mechanical keyboard
+      - wireless keyboard
+      - gaming mouse
+      - wireless mouse
+      - usb c hub
+      - docking station
+      - external ssd
+      - portable hard drive
+      - wifi router
+      - mesh wifi
+      - webcam
+
+  - name: Audio
+    queries:
+      - wireless earbuds
+      - bluetooth earbuds
+      - noise cancelling headphones
+      - over ear headphones
+      - gaming headset
+      - bluetooth speaker
+      - soundbar
+      - microphone
+      - podcast microphone
+      - studio headphones
+
+  - name: TV & Home Entertainment
+    queries:
+      - smart tv
+      - 4k tv
+      - oled tv
+      - tv wall mount
+      - streaming device
+      - home projector
+      - portable projector
+      - hdmi cable
+      - universal remote
+
+  - name: Cameras & Content Creation
+    queries:
+      - mirrorless camera
+      - action camera
+      - instant camera
+      - camera tripod
+      - ring light
+      - camera lens
+      - gimbal stabilizer
+      - memory card
+      - camera bag
+
+  - name: Gaming
+    queries:
+      - playstation accessories
+      - xbox accessories
+      - nintendo switch accessories
+      - gaming chair
+      - gaming desk
+      - gaming controller
+      - gaming keyboard
+      - gaming mouse pad
+      - racing wheel
+
+  - name: Smart Home
+    queries:
+      - smart bulb
+      - smart plug
+      - security camera
+      - video doorbell
+      - smart lock
+      - smart thermostat
+      - robot vacuum
+      - smart home sensor
+      - wifi camera
+
+  - name: Home & Kitchen
+    queries:
+      - cookware set
+      - frying pan
+      - kitchen knife set
+      - food storage containers
+      - water bottle
+      - vacuum flask
+      - coffee maker
+      - espresso machine
+      - electric kettle
+      - air fryer
+      - blender
+      - toaster
+      - rice cooker
+      - pressure cooker
+      - dinnerware set
+      - bedding set
+      - pillow
+      - bath towel
+      - storage organizer
+      - laundry basket
+
+  - name: Home Appliances
+    queries:
+      - vacuum cleaner
+      - cordless vacuum
+      - steam iron
+      - garment steamer
+      - fan
+      - air purifier
+      - humidifier
+      - portable air conditioner
+      - water dispenser
+
+  - name: Beauty & Personal Care
+    queries:
+      - perfume
+      - hair dryer
+      - hair straightener
+      - electric shaver
+      - beard trimmer
+      - electric toothbrush
+      - skin cleanser
+      - face moisturizer
+      - sunscreen
+      - shampoo
+      - conditioner
+      - hair serum
+      - makeup set
+      - foundation makeup
+      - mascara
+      - lipstick
+
+  - name: Sports & Fitness
+    queries:
+      - dumbbells
+      - resistance bands
+      - yoga mat
+      - treadmill
+      - exercise bike
+      - fitness tracker
+      - sports watch
+      - gym bag
+      - running shoes
+      - football
+      - basketball
+      - swimming goggles
+      - camping tent
+      - sleeping bag
+
+  - name: Automotive
+    queries:
+      - car charger
+      - dash cam
+      - tire inflator
+      - car vacuum
+      - car cleaning kit
+      - jump starter
+      - car battery charger
+      - obd2 scanner
+      - car seat cover
+      - car organizer
+
+  - name: Tools & Home Improvement
+    queries:
+      - cordless drill
+      - screwdriver set
+      - tool set
+      - power tool
+      - measuring tape
+      - laser level
+      - led work light
+      - extension cord
+      - surge protector
+      - ladder
+
+  - name: Office & School
+    queries:
+      - printer
+      - printer ink
+      - office chair
+      - office desk
+      - notebook
+      - pen set
+      - calculator
+      - paper shredder
+      - label printer
+      - desk organizer
+      - backpack
+
+  - name: Toys & Games
+    queries:
+      - lego set
+      - building blocks
+      - board game
+      - puzzle
+      - remote control car
+      - kids scooter
+      - educational toy
+      - dolls
+      - action figures
+      - outdoor toys
+
+  - name: Baby
+    queries:
+      - baby stroller
+      - baby car seat
+      - baby monitor
+      - baby bottle
+      - diapers
+      - baby wipes
+      - baby high chair
+      - baby carrier
+      - baby toys
+
+  - name: Pet Supplies
+    queries:
+      - cat food
+      - dog food
+      - cat litter
+      - pet carrier
+      - dog leash
+      - pet bed
+      - cat toy
+      - dog toy
+      - pet grooming
+
+  - name: Fashion & Travel
+    queries:
+      - mens watch
+      - womens watch
+      - sunglasses
+      - wallet
+      - handbag
+      - travel luggage
+      - cabin bag
+      - travel backpack
+      - sneakers
+      - sandals
