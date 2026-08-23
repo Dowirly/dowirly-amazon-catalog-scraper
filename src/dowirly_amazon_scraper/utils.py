@@ -83,6 +83,14 @@ def read_jsonl(path: Path) -> list[Any]:
     return out
 
 
+def count_jsonl(path: Path) -> int:
+    """Count non-empty JSONL records without loading the file into memory."""
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
