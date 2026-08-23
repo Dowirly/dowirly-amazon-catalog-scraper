@@ -28,8 +28,7 @@ cat > "$TMP" <<EOF
 Description=Dowirly Amazon.sa catalog scraper
 Wants=network-online.target
 After=network-online.target
-# Do not permanently enter start-limit-failed after several transient API/network
-# failures. Restart=on-failure below still avoids restarting a normal completed run.
+# Do not permanently enter start-limit-failed after transient API/network issues.
 StartLimitIntervalSec=0
 
 [Service]
@@ -39,6 +38,10 @@ WorkingDirectory=$ROOT
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$VENV_BIN --mode production --plan $PLAN
 Restart=on-failure
+# CLI exit code 3 means permanent Oxylabs authentication failure. Repeated restarts
+# cannot repair credentials and only spam the provider/logs, so leave the service
+# stopped until .env/API credentials are corrected and it is started manually.
+RestartPreventExitStatus=3
 RestartSec=20
 KillSignal=SIGTERM
 TimeoutStopSec=300
@@ -49,7 +52,6 @@ EOF
 
 sudo install -m 0644 "$TMP" "/etc/systemd/system/$SERVICE_NAME"
 sudo systemctl daemon-reload
-# Clear a previous start-limit/failed state before enabling the repaired service.
 sudo systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
 sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl restart "$SERVICE_NAME"
