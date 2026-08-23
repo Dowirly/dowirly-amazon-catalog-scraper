@@ -20,40 +20,48 @@ class AlreadyRunningError(RuntimeError):
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Collect and normalize Amazon.sa products via Oxylabs."
+        description="Collect and normalize Amazon.sa products via Oxylabs in durable waves."
     )
     p.add_argument(
         "--mode",
         choices=["test", "production"],
         default=None,
-        help="test defaults to 25 products; production maximizes unless --max-products is provided",
-    )
-    p.add_argument(
-        "--plan",
-        choices=["free", "micro"],
-        default=None,
-        help="budget/rate guard; no plans above $49 are supported",
+        help="test defaults to 25 products; production keeps going unless a limit/provider stop is reached",
     )
     p.add_argument(
         "--max-products",
         type=int,
         default=None,
-        help="stop after this many normalized products",
+        help="stop after this many normalized products; omit in production to keep going",
     )
     p.add_argument(
         "--max-results",
         type=int,
         default=None,
-        help="hard cap on Oxylabs result usage for this billing/trial period",
+        help="optional user-defined result ceiling; independent of any provider plan",
     )
     p.add_argument("--query-config", default="config/catalog_queries.yaml")
     p.add_argument("--data-dir", default="data")
     p.add_argument("--project-root", default=".")
     p.add_argument(
+        "--wave-size",
         "--batch-size",
+        dest="wave_size",
         type=int,
         default=None,
-        help="product jobs per logical Push-Pull wave; provider submission is automatically paced at the plan jobs/s limit",
+        help="full-product jobs per durable collect/save wave; default 100 in production",
+    )
+    p.add_argument(
+        "--search-wave-size",
+        type=int,
+        default=None,
+        help="search jobs per discovery wave; default 18",
+    )
+    p.add_argument(
+        "--submit-rate",
+        type=int,
+        default=None,
+        help="initial/max job submission probe rate; 429 responses auto-tune it downward",
     )
     p.add_argument("--poll-concurrency", type=int, default=None)
     p.add_argument("--poll-interval", type=float, default=2.0)
@@ -85,7 +93,6 @@ def setup_logging(verbose: bool) -> None:
 
 
 def acquire_instance_lock(data_dir: Path) -> IO[str]:
-    """Prevent a systemd run and a manual run from consuming the same quota."""
     data_dir.mkdir(parents=True, exist_ok=True)
     lock_path = data_dir / ".scraper.lock"
     handle = lock_path.open("a+", encoding="utf-8")
@@ -120,7 +127,9 @@ async def _main_async(args: argparse.Namespace) -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(
-                    sig, pipeline.request_stop, f"received_{sig.name}"
+                    sig,
+                    pipeline.request_stop,
+                    f"received_{sig.name}",
                 )
             except NotImplementedError:
                 pass
@@ -151,8 +160,6 @@ def main() -> None:
         logging.getLogger(__name__).error("%s", exc)
         code = 2
     except OxylabsAuthError as exc:
-        # Dedicated permanent-failure code. systemd uses RestartPreventExitStatus=3
-        # so invalid/revoked credentials do not create an endless restart loop.
         logging.getLogger(__name__).error("AUTH_FAILURE | %s", exc)
         code = 3
     except Exception as exc:
