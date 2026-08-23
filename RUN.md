@@ -2,7 +2,7 @@
 
 ## 1. VPS requirements
 
-Recommended: Ubuntu 22.04/24.04, Python 3.11+, 2 vCPU, 2–4 GB RAM, and enough disk for JSONL outputs. Raw results can become large on a Micro-plan run; 10+ GB free disk is a comfortable starting point.
+Recommended: Ubuntu 22.04/24.04, Python 3.11+, 2 vCPU, 2–4 GB RAM, and 10+ GB free disk for a comfortable Micro-plan run.
 
 ## 2. Clone and install
 
@@ -25,113 +25,154 @@ OXYLABS_DOMAIN=sa
 OXYLABS_LOCALE=en_AE
 ```
 
-Do not commit `.env`.
+`.env` and `data/` are ignored by Git. Pulling new code does not publish the VPS credentials or collected catalog.
 
 ## 3. Validate without spending quota
 
 ```bash
 dowirly-scrape --dry-run --mode test --plan free
-```
-
-Run tests:
-
-```bash
 python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-## 4. Small test run
+## 4. Small test
 
 ```bash
 dowirly-scrape --mode test --plan free --max-products 25
 ```
 
-`test` defaults to 25 normalized products when `--max-products` is omitted.
-
-## 5. Use the rest of the Free Trial
+## 5. Production / maximum Free Trial
 
 ```bash
 dowirly-scrape --mode production --plan free
 ```
 
-The script checks `GET https://data.oxylabs.io/v2/stats` first. If some of the 2,000 trial results are already used, it uses only the remaining guarded capacity. Your earlier manual 4xx product tests may count because Oxylabs documents 2xx and 4xx target results as billable.
+The Free Trial guard is 2,000 results. The code also keeps a **local completed-job usage floor** because Oxylabs usage statistics may lag. This means jobs already completed by this scraper still reduce the remaining guarded capacity even when the provider stats endpoint temporarily says `0`.
 
-The exact final product count will be **below the remaining Oxylabs-result count** because discovery search pages also consume results and some product pages may be rejected. The pipeline dynamically stops search discovery once it has enough ASIN candidates, preserving as much quota as possible for full `amazon_product` pages.
+The final useful product count will be lower than 2,000 because search discovery consumes results and incomplete/invalid product pages can be rejected.
 
-## 6. Specify an exact product goal
+## 6. Reboot-safe background execution (recommended)
+
+For long runs, use the included systemd installer instead of tmux:
+
+```bash
+./scripts/install_systemd.sh free
+```
+
+This creates and enables `dowirly-amazon-scraper.service`, starts it immediately, and starts it again automatically after a VPS reboot.
+
+The scraper has two recovery layers:
+
+1. Raw/final JSONL files are append-only and fsynced to disk.
+2. `data/intermediate/checkpoint.json` stores completed search/product work **and the exact Oxylabs IDs of any submitted in-flight batch**.
+
+If the VPS dies after a batch was submitted but before it was processed, the restarted program polls those same Oxylabs job IDs instead of re-submitting the same products. The in-flight marker is cleared only in the same atomic checkpoint write that records the processed batch.
+
+Useful service commands:
+
+```bash
+sudo systemctl status dowirly-amazon-scraper --no-pager
+sudo systemctl stop dowirly-amazon-scraper
+sudo systemctl start dowirly-amazon-scraper
+sudo systemctl restart dowirly-amazon-scraper
+```
+
+Disable automatic startup if you no longer want it:
+
+```bash
+sudo systemctl disable --now dowirly-amazon-scraper
+```
+
+## 7. Monitor progress
+
+While Oxylabs jobs are running, logs emit `POLL | completed_jobs=X/Y`. Every completed discovery/enrichment batch also writes a compact catalog line such as:
+
+```text
+PROGRESS | stage=enrichment | accepted=842 | rejected=91 | candidates=1935 | discovered=2510 | ...
+```
+
+Follow logs live:
+
+```bash
+journalctl -u dowirly-amazon-scraper -f -o cat
+```
+
+Only progress lines:
+
+```bash
+journalctl -u dowirly-amazon-scraper -f -o cat | grep --line-buffered -E 'PROGRESS \||POLL \||RESUME \|'
+```
+
+One-time file/service summary:
+
+```bash
+./scripts/status.sh
+```
+
+Continuously refresh counts every five seconds:
+
+```bash
+./scripts/status.sh --watch 5
+```
+
+The status script shows accepted products, rejected products, unique candidates, raw responses, completed checkpoint counts, in-flight jobs, systemd state, and the latest progress log.
+
+## 8. Pull future code changes without touching `.env` or data
+
+From a real Git clone:
+
+```bash
+cd ~/scripts/dowirly-amazon-catalog-scraper
+git pull --ff-only origin main
+source .venv/bin/activate
+pip install -e .
+sudo systemctl restart dowirly-amazon-scraper
+```
+
+Do not use `git clean -fdx`; that could remove ignored `.env`/runtime data.
+
+## 9. Exact product/result targets
 
 ```bash
 dowirly-scrape --mode production --plan free --max-products 500
-```
-
-Or place an even stricter Oxylabs hard cap:
-
-```bash
 dowirly-scrape --mode production --plan free --max-products 500 --max-results 700
 ```
 
-`--max-results` is a cap on total official usage visible for the guarded period, not "extra requests from now".
+`--max-results` is a hard guarded result count for the period, not an amount to add on top of existing usage.
 
-## 7. Micro plan (never above the $49 tier)
+## 10. Micro plan (never above the $49 base tier)
 
-After you manually subscribe to Oxylabs Micro:
+After manually subscribing to Micro:
 
 ```bash
 dowirly-scrape --mode production --plan micro
 ```
 
-Micro is guarded at 98,000 results. The program intentionally does not support Starter or higher plans. It also does not purchase top-ups. Oxylabs lists Micro at $49/month before applicable VAT, so VAT can make the invoice exceed $50 even though the base plan is $49.
-
-For a target instead of consuming the whole remaining plan:
+or install the reboot-safe service for Micro:
 
 ```bash
-dowirly-scrape --mode production --plan micro --max-products 90000
+./scripts/install_systemd.sh micro
 ```
 
-90,000 **clean full products is not guaranteed** inside 98,000 total results because discovery and billable invalid 4xx pages also use the quota. The script maximizes what can safely fit.
+Micro is guarded at 98,000 Amazon no-JS results. The code intentionally supports no higher plan and buys no top-ups. Oxylabs lists Micro at $49/month before applicable VAT.
 
-## 8. Resume after disconnect/reboot
+## 11. Balanced categories
 
-Simply run the same command again:
+`config/catalog_queries.yaml` remains grouped by category for humans, but the loader consumes it round-robin: first query from every category, then second query from every category, and so on. A limited Free Trial therefore does not get spent mostly on Mobile/Computers just because those groups appear first in YAML.
 
-```bash
-dowirly-scrape --mode production --plan free
-```
-
-`data/intermediate/checkpoint.json` remembers completed discovery waves and product ASINs. JSONL files are append-only. The official Oxylabs usage endpoint is re-checked before any new batch.
-
-## 9. Keep it running over SSH
-
-`tmux` is recommended:
-
-```bash
-sudo apt-get update && sudo apt-get install -y tmux
-tmux new -s amazon-scrape
-source .venv/bin/activate
-dowirly-scrape --mode production --plan free
-```
-
-Detach with `Ctrl+B`, then `D`. Reattach:
-
-```bash
-tmux attach -t amazon-scrape
-```
+Final product categories still come from the real Amazon product breadcrumb, not merely the discovery label.
 
 ## Useful switches
 
 ```text
---max-products N              final normalized product target
---max-results N               hard Oxylabs result-usage cap
---batch-size N                product Push-Pull batch size (max 5000)
---poll-concurrency N          concurrent status/result fetches
---dedupe-parent-asin          keep one variation per parent ASIN
---include-paid                include sponsored search listings as candidates
---allow-missing-price         don't reject missing-price products
---allow-missing-image         don't reject missing-image products
---allow-missing-category      don't reject missing-category products
---verbose                     debug logging
+--max-products N
+--max-results N
+--batch-size N
+--poll-concurrency N
+--dedupe-parent-asin
+--include-paid
+--allow-missing-price
+--allow-missing-image
+--allow-missing-category
+--verbose
 ```
-
-## Categories
-
-Edit `config/catalog_queries.yaml`. The labels there are discovery labels. The final category path is taken from the full Amazon product page's parsed `category[].ladder` field, so final records contain the real Amazon category breadcrumbs.
