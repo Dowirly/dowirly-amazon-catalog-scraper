@@ -1,10 +1,6 @@
 # Run Guide
 
-## 1. VPS requirements
-
-Recommended: Ubuntu 22.04/24.04, Python 3.11+, 2 vCPU, 2–4 GB RAM, and 10+ GB free disk for a comfortable Micro-plan run.
-
-## 2. Clone and install
+## Install
 
 ```bash
 git clone https://github.com/Dowirly/dowirly-amazon-catalog-scraper.git
@@ -14,197 +10,164 @@ sudo apt install -y python3 python3-pip python3-venv
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -e .
+pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with the Oxylabs Web Scraper API credentials.
 
-```env
-OXYLABS_USERNAME=your_api_username
-OXYLABS_PASSWORD=your_api_password
-OXYLABS_DOMAIN=sa
-OXYLABS_LOCALE=en_AE
-```
-
-`.env` and `data/` are ignored by Git. Pulling new code does not publish the VPS credentials or collected catalog.
-
-## 3. Validate without spending quota
+## Validate without spending quota
 
 ```bash
-dowirly-scrape --dry-run --mode test --plan free
-python -m pip install -e ".[dev]"
+source .venv/bin/activate
 python -m pytest -q
+dowirly-scrape --dry-run --mode test
 ```
 
-## 4. Small test
+## Production
 
 ```bash
-dowirly-scrape --mode test --plan free --max-products 25
+dowirly-scrape --mode production
 ```
 
-## 5. Production / maximum Free Trial
+There is no named `free` / `micro` / other-plan setting in the scraper. If `--max-products` is omitted, production keeps going until one of these happens:
+
+- the provider refuses more work / subscription access ends;
+- an optional `--max-results` ceiling is reached;
+- all configured search pages are exhausted;
+- the process is stopped.
+
+Example explicit product target:
 
 ```bash
-dowirly-scrape --mode production --plan free
+dowirly-scrape --mode production --max-products 5000
 ```
 
-If `--max-products` is omitted in production, the scraper attempts to maximize useful full products within the guarded plan result limit.
+Optional provider-independent result ceiling:
 
-The Free Trial guard is 2,000 results. The code also keeps a **local completed-job usage floor** because Oxylabs usage statistics may lag. This means jobs already completed by this scraper still reduce the remaining guarded capacity even when the provider stats endpoint temporarily says `0`.
+```bash
+dowirly-scrape --mode production --max-results 90000
+```
 
-The final useful product count will be lower than 2,000 because search discovery consumes results and incomplete/invalid product pages can be rejected.
+## Durable waves
 
-## 6. Maximum safe speed
-
-Oxylabs documents a job-submission rate of **10 jobs/s on Free Trial** and **50 jobs/s on Micro**. A batch request containing multiple query values still creates one provider job per value.
-
-The scraper therefore automatically splits large logical batches into plan-sized chunks and submits them about once per second:
-
-- Free Trial: up to 10 new jobs per submission window.
-- Micro: up to 50 new jobs per submission window.
-
-This keeps many Oxylabs Push-Pull jobs executing in parallel while staying just under the advertised submission limit. It is not a sequential product-by-product scraper.
-
-Logs show submission and completion progress:
+Full-product work is not submitted as one huge provider-side backlog anymore. The production default is:
 
 ```text
-SUBMIT | accepted_jobs=100/1800 | last_chunk=10 | safe_plan_rate=10 jobs/s
-POLL | completed_jobs=350/1800
+submit up to 100 product jobs
+→ poll/download them
+→ save raw results
+→ normalize products
+→ save products.jsonl + embedding_input.jsonl
+→ update checkpoint
+→ only then submit the next wave
 ```
 
-HTTP 429 is handled with adaptive backoff and retry instead of immediately killing the run. Oxylabs documents 429 rate-limit responses as unbilled.
+This makes progress visible and limits exposure if provider access disappears at a quota/subscription boundary. Existing old in-flight backlogs are also recovered 100 jobs at a time.
 
-## 7. Never run two scraper instances
-
-Do not manually start `dowirly-scrape --mode production` while the systemd service is already running. Both processes would share the same Oxylabs account/rate limit.
-
-The CLI now holds a Linux process lock. A second non-dry-run instance exits immediately with a clear message instead of competing for quota.
-
-Check whether the service is already running:
+Change the wave size if needed:
 
 ```bash
-sudo systemctl status dowirly-amazon-scraper --no-pager
+dowirly-scrape --mode production --wave-size 200
 ```
 
-## 8. Reboot-safe background execution (recommended)
+`--batch-size` remains an alias for `--wave-size` for compatibility.
 
-For long runs, use the included systemd installer instead of tmux:
+## Maximum speed without plan coupling
+
+The scraper does not map a subscription name to a fixed rate. It starts from a configurable submission probe ceiling (default 50 jobs/s):
 
 ```bash
-bash scripts/install_systemd.sh free
+dowirly-scrape --mode production --submit-rate 100
 ```
 
-This creates and enables `dowirly-amazon-scraper.service`, starts it immediately, and starts it again automatically after a VPS reboot.
+or in `.env`:
 
-The scraper has two recovery layers:
+```env
+OXYLABS_SUBMIT_RATE=100
+```
 
-1. Raw/final JSONL files are append-only and fsynced to disk.
-2. `data/intermediate/checkpoint.json` stores completed search/product work **and the exact Oxylabs IDs of any submitted in-flight batch**.
+If Oxylabs returns HTTP 429, the submission rate is automatically tuned downward and then cautiously probed upward again. Polling/result downloads are separately paced to avoid burst throttling.
 
-During a large rate-paced batch, accepted provider job IDs are checkpointed after every submission chunk. If the VPS dies halfway through submitting or polling a batch, the restarted program polls those already-created Oxylabs job IDs instead of blindly re-submitting them.
+## Reboot-safe background service
 
-Useful service commands:
+Install once:
 
 ```bash
-sudo systemctl status dowirly-amazon-scraper --no-pager
+bash scripts/install_systemd.sh
+```
+
+The service starts immediately, is enabled at boot, and runs:
+
+```text
+dowirly-scrape --mode production
+```
+
+No named plan is stored in the systemd unit.
+
+Useful commands:
+
+```bash
+sudo systemctl status dowirly-amazon-scraper --no-pager -l
 sudo systemctl stop dowirly-amazon-scraper
 sudo systemctl start dowirly-amazon-scraper
 sudo systemctl restart dowirly-amazon-scraper
 ```
 
-Disable automatic startup if you no longer want it:
+After a VPS reboot, systemd starts the service automatically. The checkpoint contains completed work plus exact provider job IDs for the current in-flight wave, so already-submitted work is resumed rather than blindly re-submitted.
+
+## Monitoring
 
 ```bash
-sudo systemctl disable --now dowirly-amazon-scraper
+bash scripts/status.sh
+bash scripts/status.sh --watch 5
 ```
 
-## 9. Monitor progress
-
-While Oxylabs jobs are being submitted and processed, logs emit `SUBMIT`, `POLL`, and `PROGRESS` records.
-
-Follow logs live:
+Live logs:
 
 ```bash
 sudo journalctl -u dowirly-amazon-scraper -f -o cat
 ```
 
-Only progress lines:
+Progress-only logs:
 
 ```bash
-sudo journalctl -u dowirly-amazon-scraper -f -o cat | grep --line-buffered -E 'SUBMIT \||PROGRESS \||POLL \||RESUME \||RATE_LIMIT \|'
+sudo journalctl -u dowirly-amazon-scraper -f -o cat \
+  | grep --line-buffered -E 'WAVE \||SUBMIT \||SUBMIT_RATE_ADAPT \||RESUME \||POLL \||PROGRESS \||RATE_LIMIT \||PROVIDER_STOP'
 ```
 
-One-time file/service summary:
+## Pull updates without touching runtime data
 
-```bash
-bash scripts/status.sh
-```
-
-Continuously refresh counts every five seconds:
-
-```bash
-bash scripts/status.sh --watch 5
-```
-
-The status script shows accepted products, rejected products, unique candidates, raw responses, completed checkpoint counts, in-flight jobs, systemd state, and the latest progress log.
-
-## 10. Pull future code changes without touching `.env` or data
-
-From a real Git clone:
+`.env` and `data/` are ignored by Git.
 
 ```bash
 cd ~/scripts/dowirly-amazon-catalog-scraper
+sudo systemctl stop dowirly-amazon-scraper || true
 git pull --ff-only origin main
 source .venv/bin/activate
-pip install -e .
-sudo systemctl restart dowirly-amazon-scraper
+pip install -e ".[dev]"
+python -m pytest -q
+bash scripts/install_systemd.sh
 ```
 
-Do not use `git clean -fdx`; that could remove ignored `.env`/runtime data.
+Never use `git clean -fdx` on this checkout because it can remove ignored credentials/runtime data.
 
-## 11. Exact product/result targets
-
-```bash
-dowirly-scrape --mode production --plan free --max-products 500
-dowirly-scrape --mode production --plan free --max-products 500 --max-results 700
-```
-
-`--max-results` is a hard guarded result count for the period, not an amount to add on top of existing usage.
-
-## 12. Micro plan (never above the $49 base tier)
-
-After manually subscribing to Micro:
-
-```bash
-dowirly-scrape --mode production --plan micro
-```
-
-or install the reboot-safe service for Micro:
-
-```bash
-bash scripts/install_systemd.sh micro
-```
-
-Micro is guarded at 98,000 Amazon no-JS results. The code intentionally supports no higher plan and buys no top-ups. Oxylabs lists Micro at $49/month before applicable VAT.
-
-## 13. Balanced categories
-
-`config/catalog_queries.yaml` remains grouped by category for humans, but the loader consumes it round-robin: first query from every category, then second query from every category, and so on. A limited Free Trial therefore does not get spent mostly on Mobile/Computers just because those groups appear first in YAML.
-
-Final product categories still come from the real Amazon product breadcrumb, not merely the discovery label.
-
-## Useful switches
+## Main outputs
 
 ```text
---max-products N
---max-results N
---batch-size N
---poll-concurrency N
---dedupe-parent-asin
---include-paid
---allow-missing-price
---allow-missing-image
---allow-missing-category
---verbose
+data/final/products.jsonl
+```
+
+Full normalized products for the database.
+
+```text
+data/final/embedding_input.jsonl
+```
+
+Embedding-ready text + metadata keyed by the same product ID.
+
+Partial discovery-only products are kept at:
+
+```text
+data/intermediate/unique_candidates.jsonl
 ```
