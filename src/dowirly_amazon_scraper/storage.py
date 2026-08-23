@@ -89,6 +89,9 @@ class Storage:
     def final_asins(self) -> set[str]:
         return {str(r.get("external_id")) for r in read_jsonl(self.paths.final_products) if r.get("external_id")}
 
+    def embedding_asins(self) -> set[str]:
+        return {str(r.get("external_id")) for r in read_jsonl(self.paths.embedding_input) if r.get("external_id")}
+
     def completed_billable_job_ids(self) -> set[str]:
         """Return locally observed completed Oxylabs job IDs.
 
