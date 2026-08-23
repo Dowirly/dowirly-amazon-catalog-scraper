@@ -67,13 +67,28 @@ class SearchPlan:
 def load_search_plan(path: Path) -> SearchPlan:
     with path.open("r", encoding="utf-8") as f:
         raw: dict[str, Any] = yaml.safe_load(f) or {}
-    queries: list[SearchQuery] = []
+    # Keep discovery balanced across categories. The YAML groups queries by
+    # category for readability, but consuming it category-by-category would spend
+    # a small Free Trial mostly on the first few categories. Interleave the first
+    # query from every category, then the second query from every category, etc.
+    category_queries: list[list[SearchQuery]] = []
     for category in raw.get("categories", []):
         label = str(category["name"]).strip()
+        items: list[SearchQuery] = []
         for query in category.get("queries", []):
             query = str(query).strip()
             if query:
-                queries.append(SearchQuery(label, query))
+                items.append(SearchQuery(label, query))
+        if items:
+            category_queries.append(items)
+
+    queries: list[SearchQuery] = []
+    max_depth = max((len(items) for items in category_queries), default=0)
+    for index in range(max_depth):
+        for items in category_queries:
+            if index < len(items):
+                queries.append(items[index])
+
     if not queries:
         raise ValueError(f"No search queries found in {path}")
     sorts = [str(v) for v in raw.get("sorts", ["featured", "bestsellers"])]
