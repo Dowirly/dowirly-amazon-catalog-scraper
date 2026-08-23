@@ -56,7 +56,7 @@ The final useful product count will be lower than 2,000 because search discovery
 For long runs, use the included systemd installer instead of tmux:
 
 ```bash
-./scripts/install_systemd.sh free
+bash scripts/install_systemd.sh free
 ```
 
 This creates and enables `dowirly-amazon-scraper.service`, starts it immediately, and starts it again automatically after a VPS reboot.
@@ -94,25 +94,25 @@ PROGRESS | stage=enrichment | accepted=842 | rejected=91 | candidates=1935 | dis
 Follow logs live:
 
 ```bash
-journalctl -u dowirly-amazon-scraper -f -o cat
+sudo journalctl -u dowirly-amazon-scraper -f -o cat
 ```
 
 Only progress lines:
 
 ```bash
-journalctl -u dowirly-amazon-scraper -f -o cat | grep --line-buffered -E 'PROGRESS \||POLL \||RESUME \|'
+sudo journalctl -u dowirly-amazon-scraper -f -o cat | grep --line-buffered -E 'PROGRESS \||POLL \||RESUME \|'
 ```
 
 One-time file/service summary:
 
 ```bash
-./scripts/status.sh
+bash scripts/status.sh
 ```
 
 Continuously refresh counts every five seconds:
 
 ```bash
-./scripts/status.sh --watch 5
+bash scripts/status.sh --watch 5
 ```
 
 The status script shows accepted products, rejected products, unique candidates, raw responses, completed checkpoint counts, in-flight jobs, systemd state, and the latest progress log.
@@ -151,7 +151,7 @@ dowirly-scrape --mode production --plan micro
 or install the reboot-safe service for Micro:
 
 ```bash
-./scripts/install_systemd.sh micro
+bash scripts/install_systemd.sh micro
 ```
 
 Micro is guarded at 98,000 Amazon no-JS results. The code intentionally supports no higher plan and buys no top-ups. Oxylabs lists Micro at $49/month before applicable VAT.
